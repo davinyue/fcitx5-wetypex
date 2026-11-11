@@ -4,8 +4,80 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      runtime_checks:
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  arm64:
+    uses: ./.github/workflows/packages-arm64.yml
+    permissions:
+      contents: read
+    with:
+      runtime_checks: true
+  nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 2
+            cores = 2
+      - name: 检查 flake 并构建 Nix 包
+        run: |
+          nix flake check --no-write-lock-file --print-build-logs
+      - name: 验证 Nix 包的真实核心、传输与语音
+        shell: bash
+        run: |
+          nix build .#fcitx5-wetypex --no-write-lock-file --out-link "$RUNNER_TEMP/wetypex-runtime"
+          prefix=$(readlink -f "$RUNNER_TEMP/wetypex-runtime")
+          "$prefix/bin/fcitx5-wetypex-account" network-info > "$RUNNER_TEMP/wetypex-network.json"
+          if ! python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["execution_ready"]' "$RUNNER_TEMP/wetypex-network.json"; then
+            nix build --impure --no-write-lock-file --out-link "$RUNNER_TEMP/wetypex-runtime" --expr \
+              'let f = builtins.getFlake (toString ./.); in (builtins.getAttr builtins.currentSystem f.packages).default.override { enableCompatibilityProvider = true; }'
+            prefix=$(readlink -f "$RUNNER_TEMP/wetypex-runtime")
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends espeak-ng
+          # Use an independent root-owned fixture; the original process still
+          # runs inside the package sandbox and receives no Actions credentials.
+          sudo env PATH="$PATH" WETYPEX_PREFIX="$prefix" \
+            XDG_DATA_HOME="$RUNNER_TEMP/wetypex-data" \
+            XDG_CACHE_HOME="$RUNNER_TEMP/wetypex-cache" \
+            XDG_CONFIG_HOME="$RUNNER_TEMP/wetypex-config" bash -euc '
+              trap '\''status=$?; if [ "$status" -ne 0 ]; then python3 -c "import json,os; from pathlib import Path; p=Path(os.environ[\"XDG_CACHE_HOME\"])/\"voice.json\"; v=json.loads(p.read_text()) if p.exists() else {}; print({k:v.get(k) for k in (\"ok\",\"state\",\"error\")})"; tail -n 80 "$XDG_DATA_HOME/fcitx5-wetypex/state/voice/backend.log" | grep -Eiv "cookie|token|identity|match_code|uin" || true; fi'\'' EXIT
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-setup" --download --accept-upstream-license
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-setup" --check --transport
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-account" pairing-code > "$XDG_CACHE_HOME/pairing.json"
+              python3 -c '\''import json,os; assert json.load(open(os.environ["XDG_CACHE_HOME"]+"/pairing.json"))["ok"]'\''
+              espeak-ng -v en-us -s 135 -w "$XDG_CACHE_HOME/speech.wav" "Hello, this is a voice input compatibility check. One two three."
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" transcribe "$XDG_CACHE_HOME/speech.wav" --realtime > "$XDG_CACHE_HOME/voice.json"
+              python3 -c '\''import json,os; v=json.load(open(os.environ["XDG_CACHE_HOME"]+"/voice.json")); assert v["ok"] and v["text"].strip()'\''
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" shutdown
+            '
+      - name: 清理独立运行数据
+        if: always()
+        run: sudo rm -rf "$RUNNER_TEMP/wetypex-data" "$RUNNER_TEMP/wetypex-cache" "$RUNNER_TEMP/wetypex-config"
+      - name: 检查源码包中的 Nix 入口
+        run: |
+          python3 tools/package_release.py
+          mkdir -p "$RUNNER_TEMP/wetypex-source"
+          tar -xzf dist/arch/fcitx5-wetypex-*.tar.gz -C "$RUNNER_TEMP/wetypex-source"
+          source_dir=$(find "$RUNNER_TEMP/wetypex-source" -mindepth 1 -maxdepth 1 -type d)
+          nix flake check "path:$source_dir" --no-build --no-write-lock-file
+
   arch-linux:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -13,7 +85,7 @@ jobs:
       - name: 安装构建依赖
         run: >-
           pacman -Syu --noconfirm git cmake clang boost fcitx5 fcitx5-qt libime libc++
-          json-c curl openssl bubblewrap util-linux python qt6-base qt6-svg
+          json-c curl openssl bubblewrap util-linux python python-fonttools python-pillow fontconfig qt6-base qt6-svg
           qt6-webengine layer-shell-qt pipewire ffmpeg wl-clipboard libnotify polkit
       - uses: actions/checkout@v7
       - name: 配置
@@ -26,7 +98,7 @@ jobs:
             case "$script" in *-syncd.sh.in|*-update.sh.in|*-sync.sh.in) continue;; esac
             sh -n "$script"
           done
-          python3 -m py_compile scripts/setup_runtime.py tools/*.py \
+          python3 -m py_compile scripts/setup_runtime.py scripts/wechat_emoticons.py scripts/voice_stream.py tools/*.py \
             build/fcitx5-wetypex-syncd build/fcitx5-wetypex-update build/fcitx5-wetypex-sync
       - name: 构建 Arch 软件包（启用 LTO）
         run: |
@@ -71,14 +143,30 @@ jobs:
       - name: 生成 deb 与校验和
         run: |
           version=$(sed -n 's/^project([^ ]* VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          revision=$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD.in)
           sed -e "s|@WETYPEX_VERSION@|$version|g" \
+            -e "s|@WETYPEX_RELEASE@|$revision|g" \
             -e "s|@WETYPEX_STAGE@|$PWD/dist/debian-root|g" \
             -e "s|@WETYPEX_PROJECT_ROOT@|$PWD|g" \
             packaging/nfpm.yaml > dist/nfpm-debian.yaml
           "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-debian.yaml \
             --packager deb --target dist/debian/
+          test "$(dpkg-deb -f dist/debian/*.deb Version)" = "$version-$revision"
           cd dist/debian
           sha256sum fcitx5-wetypex_*.deb > SHA256SUMS
+      - name: 在旧基线上运行真实原版核心与 TLS 通道
+        run: |
+          docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            -v "$PWD/dist:/out:ro" wetypex-build-jammy bash -euc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends bubblewrap util-linux python3 python3-fonttools python3-pil fontconfig
+              dpkg --unpack /out/debian/*.deb
+              fcitx5-wetypex-setup --download --accept-upstream-license
+              fcitx5-wetypex-setup --check --transport || {
+                cat /root/.cache/fcitx5-wetypex/last-runtime-check.log; exit 1;
+              }
+            '
       - name: 保存兼容旧系统的 deb
         uses: actions/upload-artifact@v7
         with:
@@ -138,6 +226,7 @@ jobs:
           version=$(sed -n 's/^project([^ ]* VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
           revision=$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD.in)
           sed -e "s|@WETYPEX_VERSION@|$version|g" \
+            -e "s|@WETYPEX_RELEASE@|$revision|g" \
             -e "s|@WETYPEX_STAGE@|$PWD/dist/ubuntu20-root|g" \
             -e "s|@WETYPEX_PROJECT_ROOT@|$PWD|g" \
             -e 's/libc6 (>= 2.35)/libc6 (>= 2.31)/' \
@@ -147,8 +236,22 @@ jobs:
             packaging/nfpm.yaml > dist/nfpm-focal.yaml
           "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-focal.yaml --packager deb \
             --target "dist/ubuntu20/fcitx5-wetypex-legacy_${version}-${revision}_amd64.deb"
+          test "$(dpkg-deb -f dist/ubuntu20/*.deb Version)" = "$version-$revision"
           cd dist/ubuntu20
           sha256sum *.deb > SHA256SUMS
+      - name: 在 Focal 与稳定框架 SDK 中运行真实核心
+        run: |
+          docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            -v "$PWD/dist:/out:ro" wetypex-build-focal bash -euc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends bubblewrap util-linux python3 python3-fonttools python3-pil fontconfig
+              dpkg --unpack /out/ubuntu20/*.deb
+              fcitx5-wetypex-setup --download --accept-upstream-license
+              fcitx5-wetypex-setup --check --transport || {
+                cat /root/.cache/fcitx5-wetypex/last-runtime-check.log; exit 1;
+              }
+            '
       - uses: actions/upload-artifact@v7
         with:
           name: fcitx5-wetypex-focal-legacy

@@ -122,6 +122,8 @@ static std::mutex business_task_mutex;
 static std::vector<unsigned char> business_task_response;
 
 static void business_log(int level, const char *message) {
+  if (getenv("WETYPE_VOICE_STREAM") && level < 3)
+    return;
   fprintf(stderr, "BUSINESS[%d] %s\n", level, message ? message : "");
 }
 static void business_init_callback(void *, int error, bool has_uin,
@@ -398,6 +400,7 @@ static bool save_business_identity(const char *path,
   return ok;
 }
 
+#include "native_voice.hpp"
 static void business_service() {
   const char *identity_path = getenv("WETYPE_IDENTITY_FILE");
   BusinessIdentity identity = load_business_identity(identity_path);
@@ -444,7 +447,7 @@ static void business_service() {
   mkdir(business_work, 0700);
   BusinessNetworkConfig network{5,
                                 0,
-                                "2.2.3(657)",
+                                upstream_app_version.c_str(),
                                 identity.model.c_str(),
                                 "",
                                 identity.device_code.c_str(),
@@ -478,6 +481,20 @@ static void business_service() {
   if (business_init_error == 0 && business_init_uin) {
     identity.uin = business_init_uin.load();
     save_business_identity(identity_path, identity);
+  }
+  if (getenv("WETYPE_VOICE_STREAM")) {
+    if (business_init_error != 0 || !business_init_uin)
+      _exit(78);
+    if (!starting_uin) {
+      const auto uin = std::to_string(business_init_uin.load());
+      ((void (*)(const char *))syms.at("_business_reset_uin"))(uin.c_str());
+      // Apply the newly registered identity before its first voice request,
+      // as in the existing one-shot business path. This runs while capture
+      // is already in progress and is unnecessary on subsequent sessions.
+      usleep(750000);
+    }
+    native_voice::run();
+    _exit(0);
   }
   int pairing_task = -1;
   std::string collected_voice_text;
@@ -536,7 +553,7 @@ static void business_service() {
       std::vector<unsigned char> device;
       protobuf_string(device, 1, identity.model);
       protobuf_uint(device, 2, 5);
-      protobuf_string(device, 4, "2.2.3(657)");
+      protobuf_string(device, 4, upstream_app_version);
       protobuf_uint(device, 5, 1);
       protobuf_string(request, 3,
                       std::string(reinterpret_cast<const char *>(device.data()),
@@ -546,7 +563,8 @@ static void business_service() {
     } else if (operation_subcommand == 32) {
       protobuf_string(request, 3, getenv("WETYPE_CONFIRM_BIND_ID"));
     } else if (operation_subcommand == 34) {
-      protobuf_uint(request, 3, 31); // devices, clipboard, hotwords and dict
+      // Read pending invitations without consuming any transfer code.
+      protobuf_uint(request, 3, getenv("WETYPE_PENDING_FILE_INVITE") ? 65 : 31);
       // GetGroupInfoReq.current_clipboard_version.  Both native desktop
       // clients send their last accepted version as the synchronization
       // cursor. The client still compares the response because the service
@@ -848,6 +866,7 @@ static void business_service() {
   std::string response_clipboard_binary;
   std::string response_clipboard;
   auto devices = wire::Json(json_object_new_array());
+  auto pendingInvites = wire::Json(json_object_new_array());
   if (operation_subcommand == 34) {
     response_error_code =
         protobuf_uint_field(business_task_response, 2, UINT64_MAX);
@@ -856,6 +875,19 @@ static void business_service() {
       group = std::move(groups.front());
       response_group_id = protobuf_uint_field(group, 1, 0);
       response_func_switch = protobuf_uint_field(group, 5, 0);
+      if (getenv("WETYPE_PENDING_FILE_INVITE")) {
+        const auto invites = protobuf_messages_field(group, 7);
+        for (size_t i = 0; i < std::min<size_t>(invites.size(), 32); ++i) {
+          auto invite = wire::object();
+          wire::put(invite.get(), "transfer_code",
+                    protobuf_string_field(invites[i], 1));
+          wire::put(invite.get(), "device_name",
+                    protobuf_string_field(invites[i], 2));
+          wire::put(invite.get(), "sender_uin",
+                    int64_t(protobuf_uint_field(invites[i], 3, 0)));
+          json_object_array_add(pendingInvites.get(), invite.release());
+        }
+      }
       auto hotwords = protobuf_messages_field(group, 4);
       if (!hotwords.empty())
         response_hotword_version = protobuf_uint_field(hotwords.front(), 1, 0);
@@ -1018,6 +1050,9 @@ static void business_service() {
   wire::put(report.get(), "peer_dispatch_buf", response_peer_dispatch_buf);
   json_object_object_add(report.get(), "peer", response_peer.release());
   json_object_object_add(report.get(), "devices", devices.release());
+  if (getenv("WETYPE_PENDING_FILE_INVITE"))
+    json_object_object_add(report.get(), "pending_invites",
+                           pendingInvites.release());
   puts(wire::dump(report.get()).c_str());
   fflush(stdout);
   // The original report service owns delayed timers that may outlive this

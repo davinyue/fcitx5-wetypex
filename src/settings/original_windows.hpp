@@ -4,6 +4,8 @@
 #include <QAbstractButton>
 #include <QBoxLayout>
 #include <QFrame>
+#include <QCursor>
+#include <QGuiApplication>
 #include <QFile>
 #include <QIcon>
 #include <QKeyEvent>
@@ -11,14 +13,22 @@
 #include <QMap>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPen>
 #include <QPixmap>
+#include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScreen>
+#include <QStyle>
+#include <QResizeEvent>
+#include <QShowEvent>
+#include <QSizeGrip>
 #include <QStandardPaths>
 #include <QSvgRenderer>
 #include <QTabBar>
 #include <QToolButton>
 #include <QWidget>
+#include <QWindow>
 
 namespace original_ui {
 
@@ -133,7 +143,15 @@ class SourceIconButton final : public QAbstractButton {
     QPixmap pixmap(46, 28);
     pixmap.fill(Qt::transparent);
     QPainter painter(&pixmap);
-    renderer.render(&painter, pixmap.rect());
+    if (renderer.isValid()) {
+      renderer.render(&painter, pixmap.rect());
+    } else {
+      // The window must remain closable before upstream artwork is installed.
+      painter.setRenderHint(QPainter::Antialiasing);
+      painter.setPen(QPen(QColor("#555555"), 1.5));
+      painter.drawLine(QPointF(18, 9), QPointF(28, 19));
+      painter.drawLine(QPointF(28, 9), QPointF(18, 19));
+    }
     return pixmap;
   }
 
@@ -202,21 +220,102 @@ protected:
 
 class Window final : public QWidget {
   QPoint dragOffset_;
+  QSizeGrip *sizeGrip_ = nullptr;
+  QPointer<QAbstractButton> closeButton_;
+  bool firstShow_ = true;
+
+  void fitInitialScreen() {
+    auto *screen = windowHandle() ? windowHandle()->screen() : nullptr;
+    if (!screen)
+      screen = QGuiApplication::screenAt(QCursor::pos());
+    if (!screen)
+      screen = QGuiApplication::primaryScreen();
+    if (!screen)
+      return;
+    auto frame = frameGeometry().size() - size();
+    if (!windowFlags().testFlag(Qt::FramelessWindowHint))
+      frame.setHeight(qMax(frame.height(),
+                           style()->pixelMetric(QStyle::PM_TitleBarHeight)));
+    const auto available =
+        (screen->availableGeometry().size() - frame - QSize(24, 24))
+            .expandedTo(QSize(1, 1));
+    setMinimumSize(QSize(600, 450).boundedTo(available));
+    if (!isMaximized() && !isFullScreen())
+      resize(size().boundedTo(available));
+  }
+
+  void updateSizeGrip() {
+    sizeGrip_->resize(sizeGrip_->sizeHint());
+    sizeGrip_->move(width() - sizeGrip_->width(), height() - sizeGrip_->height());
+    sizeGrip_->setVisible(!isMaximized() && !isFullScreen());
+    sizeGrip_->raise();
+  }
 
 public:
+  void anchorCloseButton(QAbstractButton *button) {
+    closeButton_ = button;
+    button->parentWidget()->installEventFilter(this);
+    button->move(button->parentWidget()->width() - button->width(), 0);
+    button->raise();
+  }
   explicit Window(QWidget *parent = nullptr) : QWidget(parent) {
-    setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+    auto flags = Qt::Window | Qt::WindowMinMaxButtonsHint;
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    flags |= Qt::FramelessWindowHint;
+#endif
+    // Qt 5.12 has no public system-move/resize API for Wayland. Its native
+    // window frame supplies those operations, including maximize/restore.
+    setWindowFlags(flags);
     setAttribute(Qt::WA_TranslucentBackground);
-    setFixedSize(715, 569);
+    setMinimumSize(600, 450);
+    resize(715, 569);
+    sizeGrip_ = new QSizeGrip(this);
+    sizeGrip_->setStyleSheet("background:transparent;");
+    fitInitialScreen();
+  }
+  ~Window() override {
+    for (auto *process :
+         findChildren<QProcess *>(QString(), Qt::FindDirectChildrenOnly))
+      wetype::stopProcess(*process, this);
   }
 
 protected:
-  void mousePressEvent(QMouseEvent *event) override {
-    if (event->button() == Qt::LeftButton && wetype::mousePosition(event).y() < 58) {
-      dragOffset_ =
-          wetype::mouseGlobalPosition(event) - frameGeometry().topLeft();
-      event->accept();
+  bool eventFilter(QObject *object, QEvent *event) override {
+    if (closeButton_ && object == closeButton_->parentWidget() &&
+        event->type() == QEvent::Resize) {
+      closeButton_->move(closeButton_->parentWidget()->width() -
+                             closeButton_->width(),
+                         0);
+      closeButton_->raise();
     }
+    return QWidget::eventFilter(object, event);
+  }
+  void mouseDoubleClickEvent(QMouseEvent *event) override {
+    if (event->button() == Qt::LeftButton &&
+        wetype::mousePosition(event).y() < 58) {
+      dragOffset_ = {};
+      isMaximized() ? showNormal() : showMaximized();
+      event->accept();
+      return;
+    }
+    QWidget::mouseDoubleClickEvent(event);
+  }
+  void mousePressEvent(QMouseEvent *event) override {
+    if (event->button() != Qt::LeftButton ||
+        wetype::mousePosition(event).y() >= 58)
+      return;
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    dragOffset_ = {};
+    if (windowHandle() && windowHandle()->startSystemMove()) {
+      event->accept();
+      return;
+    }
+#endif
+
+    dragOffset_ =
+        wetype::mouseGlobalPosition(event) - frameGeometry().topLeft();
+    event->accept();
   }
   void mouseMoveEvent(QMouseEvent *event) override {
     if (event->buttons().testFlag(Qt::LeftButton) && !dragOffset_.isNull()) {
@@ -225,6 +324,27 @@ protected:
     }
   }
   void mouseReleaseEvent(QMouseEvent *) override { dragOffset_ = {}; }
+  void resizeEvent(QResizeEvent *event) override {
+    QWidget::resizeEvent(event);
+    if (sizeGrip_)
+      updateSizeGrip();
+  }
+  void showEvent(QShowEvent *event) override {
+    QWidget::showEvent(event);
+    if (firstShow_) {
+      firstShow_ = false;
+      fitInitialScreen();
+      if (auto *handle = windowHandle())
+        QObject::connect(handle, &QWindow::screenChanged, this,
+                         [this](QScreen *) { fitInitialScreen(); });
+    }
+    updateSizeGrip();
+  }
+  void changeEvent(QEvent *event) override {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange && sizeGrip_)
+      updateSizeGrip();
+  }
 };
 
 inline QFrame *card(QWidget *parent = nullptr) {
@@ -293,9 +413,8 @@ inline Page page(const QString &title, bool scroll = true) {
   area->setObjectName("pageScroll");
   area->setFrameShape(QFrame::NoFrame);
   area->setWidgetResizable(true);
-  area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-  area->setVerticalScrollBarPolicy(scroll ? Qt::ScrollBarAsNeeded
-                                          : Qt::ScrollBarAlwaysOff);
+  area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+  area->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
   area->setWidget(viewport);
   layout->addWidget(area, 1);
   return {widget, body, area};

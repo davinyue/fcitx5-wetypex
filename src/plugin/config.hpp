@@ -29,6 +29,8 @@ enum class ThemeMode { System, Light, Dark };
 FCITX_CONFIG_ENUM_NAME(ThemeMode, "跟随系统", "浅色", "深色")
 enum class CandidateLabelStyle { WeType, Fcitx };
 FCITX_CONFIG_ENUM_NAME(CandidateLabelStyle, "微信风格", "Fcitx 默认")
+enum class PreeditPosition { Client, Candidate };
+FCITX_CONFIG_ENUM_NAME(PreeditPosition, "输入框内", "候选框内")
 enum class VoicePunctuationMode { Smart, Full, NoPeriod, Spaces };
 FCITX_CONFIG_ENUM_NAME(VoicePunctuationMode, "智能标点", "添加完整标点",
                        "句末不加句号", "空格替换标点")
@@ -47,13 +49,17 @@ FCITX_CONFIGURATION(
     Option<bool> wubiWildcardComment{this, "WubiWildcardComment",
                                      "通配符编码提示", false};
     Option<bool> smartInput{this, "SmartInput", "智能拼写", true};
+    Option<bool> englishCompletion{this, "EnglishCompletion", "英文单词补全",
+                                   false};
     Option<bool> emojiRecommend{this, "EmojiRecommend", "表情和颜文字推荐",
                                 true};
-    Option<bool> wechatEmoji{this, "WechatEmoji", "微信表情推荐", true};
+    Option<bool> wechatEmoji{this, "WechatEmoji",
+                             "微信表情推荐（仅微信客户端）", true};
     Option<bool> normalEmoji{this, "NormalEmoji", "Emoji 推荐", true};
     Option<bool> kaomoji{this, "Kaomoji", "颜文字推荐", true};
     Option<bool> largeEmoji{this, "LargeEmoji", "大表情推荐", true};
     Option<bool> symbolEmoji{this, "SymbolEmoji", "符号表情推荐", true};
+    Option<bool> chinesePunctuation{this, "ChinesePunctuation", "中文模式默认使用中文标点", true};
     Option<bool> slashPunctuation{this, "SlashPunctuation",
                                   "输入中文时将 /? 替换为 、", true};
     Option<bool> symbolAutoChange{this, "SymbolAutoChange", "符号自动转换",
@@ -104,7 +110,9 @@ FCITX_CONFIGURATION(
     Option<std::string> microphone{this, "Microphone", "麦克风", "自动检测"};
     Option<VoicePunctuationMode> punctuation{this, "Punctuation", "标点设置",
                                              VoicePunctuationMode::Smart};
-    Option<bool> smartPolish{this, "SmartPolish", "语音智能整理", true};)
+    Option<bool> smartPolish{this, "SmartPolish", "语音智能整理", true};
+    Option<bool> copyToClipboard{this, "CopyToClipboard",
+                                 "识别后复制到剪贴板", true};)
 
 FCITX_CONFIGURATION(PhraseClipboardConfig,
                     Option<bool> clipboard{this, "Clipboard",
@@ -118,6 +126,13 @@ FCITX_CONFIGURATION(
     Option<int, IntConstrain> pageSize{this, "PageSize", "每页候选数", 5,
                                        IntConstrain(3, 9)};
     Option<bool> vertical{this, "Vertical", "候选词竖排", false};
+    Option<bool> autoSpace{this, "AutoSpace", "自动添加中英文空格", false};
+    Option<bool> autoSpaceDigit{this, "AutoSpaceDigit", "中文和数字间加空格",
+                                true};
+    Option<bool> autoSpaceEnglish{this, "AutoSpaceEnglish", "中文和英文间加空格",
+                                  true};
+    Option<PreeditPosition> preeditPosition{
+        this, "PreeditPosition", "拼音显示位置", PreeditPosition::Client};
     Option<CandidateLabelStyle> labelStyle{this, "CandidateLabelStyle",
                                            "候选序号样式",
                                            CandidateLabelStyle::WeType};
@@ -144,7 +159,7 @@ FCITX_CONFIGURATION(
     Option<bool> vMode{this, "VMode", "V 模式", true}; KeyListOption vModeKeys{
         this,
         "VModeKeys",
-        "V 模式按键",
+        "V 模式入口（默认 v 后按空格）",
         {Key("v")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
     Option<bool> halfFull{this, "HalfFull", "全半角输入切换", false};
@@ -168,7 +183,7 @@ FCITX_CONFIGURATION(
         this,
         "TraditionalSwitchKeys",
         "简繁体输入切换按键",
-        {Key("Control+Shift+f")},
+        {Key("Control+Shift+F")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
     Option<bool> pageMinusEqual{this, "PageMinusEqual", "减号等号翻页", true};
     Option<bool> pageBrackets{this, "PageBrackets", "左右中括号翻页", true};

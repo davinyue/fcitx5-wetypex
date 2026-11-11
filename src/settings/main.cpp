@@ -24,6 +24,7 @@
 #include <QMovie>
 #include <QPlainTextEdit>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -57,6 +58,14 @@ static QJsonObject readJsonObject(const QString &path) {
   if (!file.open(QIODevice::ReadOnly))
     return {};
   return QJsonDocument::fromJson(file.readAll()).object();
+}
+static QString processStartTicks(int pid) {
+  QFile file("/proc/" + QString::number(pid) + "/stat");
+  if (!file.open(QIODevice::ReadOnly))
+    return {};
+  const auto stat = file.readAll();
+  const auto fields = stat.mid(stat.lastIndexOf(')') + 2).split(' ');
+  return fields.size() > 19 ? QString::fromLatin1(fields[19]) : QString();
 }
 static void runAccount(QWidget *owner, const QStringList &arguments,
                        std::function<void(int, const QJsonObject &)> done) {
@@ -331,6 +340,7 @@ class PairingOverlay final : public QWidget {
   QLabel *subtitle_ = nullptr;
   QLabel *message_ = nullptr;
   QLabel *digits_[6]{};
+  QFrame *dialog_ = nullptr;
   QString code_;
   Stage stage_ = Stage::Code;
   int transientFailures_ = 0;
@@ -412,13 +422,19 @@ class PairingOverlay final : public QWidget {
   }
 
 public:
+  ~PairingOverlay() override {
+    poll_.stop();
+    wetype::stopProcess(process_, this);
+  }
+
   explicit PairingOverlay(QWidget *parent) : QWidget(parent), process_(this) {
     setGeometry(parent->rect());
+    parent->installEventFilter(this);
     setObjectName("pairingOverlay");
     setStyleSheet("QWidget#pairingOverlay{background:rgba(0,0,0,72);}");
-    auto *dialog = new QFrame(this);
+    auto *dialog = dialog_ = new QFrame(this);
     dialog->setObjectName("pairingDialog");
-    dialog->setGeometry(149, 144, 420, 280);
+    dialog->setGeometry((width() - 420) / 2, (height() - 280) / 2, 420, 280);
     dialog->setStyleSheet(
         "QFrame#pairingDialog{background:white;border:0;border-radius:12px;}"
         "QLabel{background:transparent;}"
@@ -475,6 +491,17 @@ public:
   }
 
 protected:
+  bool eventFilter(QObject *object, QEvent *event) override {
+    if (object == parentWidget() && event->type() == QEvent::Resize)
+      setGeometry(parentWidget()->rect());
+    return QWidget::eventFilter(object, event);
+  }
+  void resizeEvent(QResizeEvent *event) override {
+    QWidget::resizeEvent(event);
+    if (dialog_)
+      dialog_->move((width() - dialog_->width()) / 2,
+                    (height() - dialog_->height()) / 2);
+  }
   void keyPressEvent(QKeyEvent *event) override {
     if (event->key() == Qt::Key_Escape) {
       deleteLater();
@@ -643,6 +670,7 @@ static void runLanguageDialog(QWidget *owner) {
 
 int main(int argc, char **argv) {
   qunsetenv("WAYLAND_SOCKET");
+  wetype::initializeHighDpi();
   QApplication app(argc, argv);
   app.setApplicationName("fcitx5-wetypex-settings");
   app.setDesktopFileName("fcitx5-wetypex-settings");
@@ -748,8 +776,7 @@ int main(int argc, char **argv) {
   rightLayout->addWidget(pages, 1);
   root->addWidget(right, 1);
   QObject::connect(close, &QAbstractButton::clicked, &window, &QWidget::close);
-  close->move(458, 0);
-  close->raise();
+  window.anchorCloseButton(close);
 
   auto input = page("输入");
   auto *pinyin = new QRadioButton("拼音输入"),
@@ -807,7 +834,7 @@ int main(int argc, char **argv) {
   auto *emojiSetup = new QPushButton("设置...");
   QObject::connect(emojiSetup, &QPushButton::clicked, [&window] {
     runToggleDialog(&window, "表情和颜文字推荐",
-                    {{"微信表情", "wechat_emoji", true},
+                    {{"微信表情（仅微信客户端）", "wechat_emoji", true},
                      {"Emoji", "normal_emoji", true},
                      {"颜文字", "kaomoji", true},
                      {"大表情", "large_emoji", true},
@@ -817,6 +844,9 @@ int main(int argc, char **argv) {
       {row("智能拼写", "精准匹配候选词，大幅提升打字效率",
            toggle(wetype::settingBool(settings.value("smart_input"), true),
                   true, "smart_input")),
+       row("英文单词补全", "英文模式下按词频显示候选，按空格补全首项",
+           toggle(wetype::settingBool(settings.value("english_completion"), false),
+                  true, "english_completion")),
        row("表情和颜文字推荐", {}, emojiSetup, 50)}));
   auto *languageSetup = new QPushButton("设置..."),
        *fuzzySetup = new QPushButton("设置...");
@@ -845,7 +875,10 @@ int main(int argc, char **argv) {
                      {"eng/ong", "fuzzy_eng_ong", false}});
   });
   input.body->addWidget(rowsCard(
-      {row("输入中文时，将「/?」按键替换为 、", {},
+      {row("中文模式默认使用中文标点", "关闭后默认使用 , . ! ? 等英文标点；Ctrl + . 可临时切换，独立于全半角",
+           toggle(wetype::settingBool(settings.value("chinese_punctuation"), true),
+                  true, "chinese_punctuation")),
+       row("输入中文时，将「/?」按键替换为 、", {},
            toggle(
                wetype::settingBool(settings.value("slash_punctuation"), true),
                true, "slash_punctuation"),
@@ -860,6 +893,16 @@ int main(int argc, char **argv) {
                   true, "symbol_auto_pair")),
        row("默认输入语言（中文/英文）", {}, languageSetup, 52),
        row("模糊拼音", {}, fuzzySetup, 52)}));
+  input.body->addWidget(rowsCard(
+      {row("自动添加中英文空格", "开启后自动调整汉字与英文字母、数字之间的间距",
+           toggle(wetype::settingBool(settings.value("auto_space"), false),
+                  true, "auto_space")),
+       row("中文和数字间加空格", "例如：你好 2024",
+           toggle(wetype::settingBool(settings.value("auto_space_digit"), true),
+                  true, "auto_space_digit")),
+       row("中文和英文间加空格", "例如：你好 Hello",
+           toggle(wetype::settingBool(settings.value("auto_space_english"), true),
+                  true, "auto_space_english"))}));
   input.body->addWidget(rowsCard(
       {row("单机模式",
            "无需网络，单机离线使用。不支持跨设备、表情推荐、问 AI 等联网功能",
@@ -896,7 +939,7 @@ int main(int argc, char **argv) {
            "启动语音输入",
            wetype::settingBool(settings.value("voice_launch_shortcut"), true),
            {"Ctrl", "Win", "Shift", "×"},
-           "按下可开启语音输入，按任意键均可结束", true,
+           "按下启动或结束；空格结束，回车上屏，Esc 取消", true,
            "voice_launch_shortcut"),
        shortcutRow(
            "按住说话",
@@ -922,11 +965,52 @@ int main(int argc, char **argv) {
         microphone->addItem(name, target);
     }
   }
+  if (microphone->count() == 1) {
+    // PulseAudio 13 (Ubuntu 20.04) has no JSON output. Keep the text keys
+    // stable across desktop languages when querying older audio servers.
+    QProcess pulse;
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
+    pulse.setProcessEnvironment(environment);
+    pulse.start(QStringLiteral("pactl"), {QStringLiteral("list"),
+                                        QStringLiteral("sources")});
+    if (pulse.waitForFinished(2000) && pulse.exitCode() == 0) {
+      QString target, description;
+      bool monitor = false;
+      auto addSource = [&] {
+        if (!target.isEmpty() && !monitor)
+          microphone->addItem(description.isEmpty() ? target : description,
+                              target);
+      };
+      const auto lines = QString::fromUtf8(pulse.readAllStandardOutput())
+                             .split(QLatin1Char('\n'));
+      for (const auto &line : lines) {
+        const auto field = line.trimmed();
+        if (line.startsWith(QStringLiteral("Source #"))) {
+          addSource();
+          target.clear();
+          description.clear();
+          monitor = false;
+        } else if (field.startsWith(QStringLiteral("Name: "))) {
+          target = field.mid(6);
+        } else if (field.startsWith(QStringLiteral("Description: "))) {
+          description = field.mid(13);
+        } else if (field.startsWith(QStringLiteral("Monitor of Sink: "))) {
+          monitor = field.mid(17) != QStringLiteral("n/a");
+        }
+      }
+      addSource();
+    }
+  }
   const auto savedMicrophone = settings.value("voice_microphone").toString();
-  if (!savedMicrophone.isEmpty()) {
-    const int index = microphone->findData(savedMicrophone);
-    if (index >= 0)
-      microphone->setCurrentIndex(index);
+  if (!savedMicrophone.isEmpty() && savedMicrophone != QStringLiteral("自动检测")) {
+    int index = microphone->findData(savedMicrophone);
+    if (index < 0) {
+      microphone->addItem(savedMicrophone + QStringLiteral("（当前不可用）"),
+                          savedMicrophone);
+      index = microphone->count() - 1;
+    }
+    microphone->setCurrentIndex(index);
   }
   QObject::connect(
       microphone, qOverload<int>(&QComboBox::currentIndexChanged), [microphone](int index) {
@@ -948,6 +1032,12 @@ int main(int argc, char **argv) {
   voice.body->addWidget(
       rowsCard({row("麦克风", "设置语音输入的默认麦克风", microphone),
                 row("标点设置", {}, punctuationMode),
+                row("识别后复制到剪贴板",
+                    "识别完成后把结果写入系统剪贴板，终端等不接收输入的窗口可直接粘贴",
+                    toggle(wetype::settingBool(
+                               settings.value("voice_copy_to_clipboard"), true),
+                           true, "voice_copy_to_clipboard"),
+                    74),
                 row("语音智能整理", {},
                     toggle(wetype::settingBool(
                                settings.value("voice_smart_polish"), true),
@@ -1103,6 +1193,20 @@ int main(int argc, char **argv) {
                                                                      : 1;
   theme->setCurrentIndex(themeMode);
   visual.body->addWidget(rowsCard({row("主题模式", {}, theme, 48)}));
+  auto *preeditPosition = new QComboBox;
+  preeditPosition->addItems({"输入框内", "候选框内"});
+  preeditPosition->setCurrentIndex(
+      settings.value("preedit_position").toString() == "candidate" ? 1 : 0);
+  visual.body->addWidget(rowsCard(
+      {row("拼音显示位置", "输入框不支持内嵌拼音时，自动显示在候选框内",
+           preeditPosition, 64)}));
+  QObject::connect(preeditPosition,
+                   qOverload<int>(&QComboBox::currentIndexChanged),
+                   [=](int index) {
+                     writeSetting("preedit_position",
+                                  index == 1 ? QStringLiteral("candidate")
+                                             : QStringLiteral("client"));
+                   });
   auto *labelStyle = new QComboBox;
   labelStyle->addItems({"微信风格", "Fcitx 默认"});
   labelStyle->setCurrentIndex(
@@ -1154,23 +1258,34 @@ int main(int argc, char **argv) {
       new QLabel("系统默认支持“ctrl + 空格”切换中英文  修改");
   defaultShortcut->setObjectName("rowSubtitle");
   shortcuts.body->addWidget(defaultShortcut);
+  QStringList vModeTriggers;
+  bool usesBareV = false;
+  for (const auto &key : settings.value("v_mode_keys").toString("v").simplified().split(' ')) {
+    if (key.isEmpty())
+      continue;
+    usesBareV |= key == "v";
+    vModeTriggers << (key == "v" ? QStringLiteral("v → 空格") : key);
+  }
+  if (vModeTriggers.isEmpty())
+    vModeTriggers << QStringLiteral("未绑定");
   shortcuts.body->addWidget(rowsCard(
       {row("快捷使用", {}, nullptr, 44),
        shortcutRow("AI 助手  Beta",
                    wetype::settingBool(settings.value("ai_assistant"), true),
                    {"="}, "输入后按「=」可使用 AI 提问、表情推荐等功能", true,
                    "ai_assistant"),
-       shortcutRow(
-           "V 模式", wetype::settingBool(settings.value("v_mode"), true), {"V"},
-           "按「v」打开快捷功能栏，可使用计算、剪贴板、常用语、符号等功能",
-           true, "v_mode")}));
+       shortcutRow("V 模式",
+                   wetype::settingBool(settings.value("v_mode"), true), vModeTriggers,
+                   usesBareV ? "v 后按空格打开；可继续输入英文或 v1+1 等计算式"
+                             : "使用已配置的按键直接打开，仅在中文全拼中生效",
+                   true, "v_mode")}));
   shortcuts.body->addWidget(rowsCard(
       {row("语音输入", {}, nullptr, 44),
        shortcutRow(
            "启动语音输入",
            wetype::settingBool(settings.value("voice_launch_shortcut"), true),
            {"Ctrl", "Win", "Shift", "×"},
-           "按下可开启语音输入，按任意键均可结束", true,
+           "按下启动或结束；空格结束，回车上屏，Esc 取消", true,
            "voice_launch_shortcut"),
        shortcutRow(
            "按住说话",
@@ -1429,6 +1544,104 @@ int main(int argc, char **argv) {
                   true, "auto_update"),
            48),
        row("我要反馈", {}, feedback, 48)}));
+  const auto runtimeRoot = QStandardPaths::writableLocation(
+      QStandardPaths::GenericDataLocation) + "/fcitx5-wetypex";
+  const auto runtimePath = qEnvironmentVariable("WETYPE_RUNTIME_DIR", runtimeRoot + "/runtime");
+  const auto supportedRuntime = readJsonObject(QStringLiteral(WETYPE_RUNTIME_PROFILES))
+                                    .value("default").toString();
+  auto *runtimeVersion = new QLabel;
+  runtimeVersion->setWordWrap(true);
+  runtimeVersion->setObjectName("rowSubtitle");
+  auto *runtimeUpdate = greenButton("下载并更新原版核心");
+  auto *runtimeRollback = new QPushButton("回退上个版本");
+  auto *runtimeCleanup = new QPushButton("清理旧版本");
+  runtimeUpdate->setObjectName("runtimeUpdate");
+  runtimeRollback->setObjectName("runtimeRollback");
+  runtimeCleanup->setObjectName("runtimeCleanup");
+  runtimeCleanup->setToolTip("保留当前、上个可回退版本和待应用更新，清理多余安装包及运行时；保留词库和配对数据");
+  auto *runtimeProcess = new QProcess(&window);
+  auto refreshRuntime = [=] {
+    const auto current = readJsonObject(runtimePath + "/runtime.json")
+                             .value("version").toString();
+    const auto pending = readJsonObject(runtimeRoot + "/runtime-pending.json");
+    const auto history = readJsonObject(runtimeRoot + "/runtime-history.json");
+    const auto operation = readJsonObject(runtimeRoot + "/runtime-operation.json");
+    const auto pid = operation.value("pid").toInt();
+    const bool operationAlive = pid > 0 ?
+        (!operation.value("start_ticks").toString().isEmpty() &&
+         processStartTicks(pid) == operation.value("start_ticks").toString())
+        : QDateTime::currentSecsSinceEpoch() - operation.value("started_at").toDouble() < 30;
+    const bool busy = runtimeProcess->state() != QProcess::NotRunning ||
+        (operation.value("busy").toBool() && operationAlive);
+    runtimeUpdate->setEnabled(!busy);
+    runtimeCleanup->setEnabled(!busy);
+    runtimeRollback->setEnabled(!busy &&
+        (pending.isEmpty() || !pending.value("error").toString().isEmpty()) &&
+        !history.value("previous").toString().isEmpty());
+    QString detail = "原版核心：" + (current.isEmpty()
+        ? (QFile::exists(runtimePath + "/image.macho") ? QStringLiteral("已安装旧版，更新后显示版本")
+                                                       : QStringLiteral("尚未安装")) : current);
+    if (!supportedRuntime.isEmpty())
+      detail += " · 支持版本：" + supportedRuntime;
+    if (busy)
+      detail += operation.value("operation").toString() == "cleanup"
+          ? QStringLiteral("\n正在清理旧版本，可继续输入…")
+          : QStringLiteral("\n正在准备并检查更新，可继续输入…");
+    else if (!pending.isEmpty()) {
+      const auto error = pending.value("error").toString();
+      const auto client = readJsonObject(runtimeRoot + "/runtime-client.json");
+      const bool liveClient = client.value("protocol").toInt() == 1 &&
+          QDateTime::currentSecsSinceEpoch() - client.value("updated_at").toDouble() < 10;
+      detail += error.isEmpty() ? (liveClient ? QStringLiteral("\n已准备就绪，将在输入结束后切换")
+                                             : QStringLiteral("\n更新已准备。首次升级请重启 Fcitx5；之后可自动切换。"))
+                               : "\n更新未应用：" + error;
+    }
+    else if (!operation.value("error").toString().isEmpty())
+      detail += "\n上次操作失败：" + operation.value("error").toString();
+    else if (operation.value("busy").toBool() && !operationAlive)
+      detail += QStringLiteral("\n上次操作已中断，可以重试。");
+    else if (operation.value("operation").toString() == "cleanup") {
+      const auto result = operation.value("result").toObject();
+      if (result.value("deferred").toBool())
+        detail += QStringLiteral("\n更新正在进行，稍后可再次清理。");
+      else if (result.contains("removed_bytes"))
+        detail += QStringLiteral("\n已清理 %1 MiB 文件，保留当前版本和回退版本。")
+            .arg(result.value("removed_bytes").toDouble() / (1024 * 1024), 0, 'f', 1);
+    }
+    runtimeVersion->setText(detail);
+  };
+  auto runRuntime = [=, &window](const QString &operation) {
+    if (operation == "update" && !QFile::exists(runtimePath + "/image.macho") &&
+        QMessageBox::question(&window, "下载原版核心",
+            "将从微信输入法官方网站下载兼容版本。请阅读并同意原版软件许可后继续。") != QMessageBox::Yes)
+      return;
+    runtimeProcess->setProgram(qEnvironmentVariable("WETYPE_SETUP_LAUNCHER", WETYPE_SETUP));
+    runtimeProcess->setProperty("runtimeOperation", operation);
+    runtimeProcess->setArguments(operation == "cleanup" ? QStringList{"--cleanup", "--background"}
+        : operation == "rollback" ? QStringList{"--rollback", "--defer", "--background"}
+        : QStringList{"--update", "--download", "--accept-upstream-license", "--defer", "--background"});
+    runtimeProcess->start();
+    refreshRuntime();
+  };
+  QObject::connect(runtimeUpdate, &QPushButton::clicked, [=] { runRuntime("update"); });
+  QObject::connect(runtimeRollback, &QPushButton::clicked, [=] { runRuntime("rollback"); });
+  QObject::connect(runtimeCleanup, &QPushButton::clicked, [=] { runRuntime("cleanup"); });
+  wetype::onProcessDone(runtimeProcess, &window, [=, &window](int code, QProcess::ExitStatus) {
+    if (code)
+      QMessageBox::warning(&window, "原版核心管理", QString::fromUtf8(
+          runtimeProcess->readAllStandardError()).right(1500));
+    refreshRuntime();
+  });
+  about.body->addWidget(runtimeVersion);
+  auto *runtimeButtons = new QHBoxLayout;
+  runtimeButtons->addWidget(runtimeUpdate);
+  runtimeButtons->addWidget(runtimeRollback);
+  runtimeButtons->addWidget(runtimeCleanup);
+  about.body->addLayout(runtimeButtons);
+  auto *runtimeTimer = new QTimer(&window);
+  QObject::connect(runtimeTimer, &QTimer::timeout, refreshRuntime);
+  runtimeTimer->start(1500);
+  refreshRuntime();
   about.body->addStretch();
   auto *copyright =
       new QLabel("WeTypeX 社区项目\n原版核心及相关商标归其权利人所有\n"
