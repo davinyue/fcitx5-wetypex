@@ -1,13 +1,14 @@
+#include "../common/appearance.hpp"
 #include "../common/json.hpp"
 #include "config.hpp"
 #include "english_dictionary.hpp"
 #include "wechat_emoji.hpp"
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <clipboard_public.h>
 #include <csignal>
 #include <cstddef>
-#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -35,14 +36,15 @@
 #include <fcitx/userinterfacemanager.h>
 #include <fcntl.h>
 #include <filesystem>
-#include <set>
 #include <fstream>
 #include <iterator>
 #include <libime/pinyin/pinyinencoder.h>
 #include <linux/input-event-codes.h>
 #include <map>
+#include <optional>
 #include <poll.h>
 #include <queue>
+#include <set>
 #include <spawn.h>
 #include <spell_public.h>
 #include <string>
@@ -51,8 +53,8 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <type_traits>
 #include <tuple>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -243,9 +245,11 @@ struct State : InputContextProperty {
   uint64_t id, epoch = 1, seq = 0, applied = 0, revision = 0, inputSeq = 0;
   uint64_t appliedUpdate = 0;
   uint64_t initialPanelDeadline = 0;
+  uint64_t initialPanelInputSeq = 0;
   bool initialPanelShown = false;
   uint64_t cloudPollUntil = 0, lastCloudPoll = 0;
   int candidatePage = 0, candidateCursor = 0;
+  wire::Json candidates, cloudFlags;
   std::string preedit;
   std::string englishWord;
   int englishCandidateCursor = 0;
@@ -255,10 +259,9 @@ struct State : InputContextProperty {
   std::vector<size_t> cursorStops;
   char pendingPairKey = 0;
   std::string pendingPairRight;
-  std::vector<std::pair<char, std::string>> outerPairs;
   uint8_t symbolAutoState = 0;
-  std::string pendingNumericText, pendingNumericReplacement;
-  uint64_t pendingNumericUntil = 0;
+  bool validateNumericState = false;
+  std::string numericPreview;
   bool doubleQuoteLeft = true, singleQuoteLeft = true;
   bool english = false, fullWidth = false, traditional = false,
        vMode = false, vCalculator = false;
@@ -275,13 +278,18 @@ struct State : InputContextProperty {
   size_t cursorViewHash = 0;
   unsigned cursorViewCursor = 0, cursorViewAnchor = 0;
   bool cursorHadView = false;
+  bool cursorResetPending = false;
+  bool cursorMoveReset = false;
+  bool cursorViewAcknowledged = false;
   std::vector<DeferredKey> cursorKeys;
   std::vector<Key> forwardedKeys;
-  bool pendingClientKey = false, pendingNumericReplay = false;
+  bool pendingClientKey = false;
   std::string clientExpected;
   size_t clientTextHash = 0;
   unsigned clientCursor = 0, clientAnchor = 0;
   bool clientHadText = false, clientCursorReplay = false;
+  bool clientRequireChange = false;
+  bool clientResetPending = false;
   bool selectionPending = false;
   std::vector<DeferredKey> deferredKeys;
   VMenu vMenu = VMenu::None;
@@ -303,6 +311,8 @@ struct State : InputContextProperty {
   State(uint64_t n, InputContext &context) : id(n), ic(context.watch()) {}
 };
 static void clearDisplayState(State *state) {
+  state->candidates.reset();
+  state->cloudFlags.reset();
   state->displayPreedit.clear();
   state->displayCursor = 0;
   state->editableBegin = 0;
@@ -365,13 +375,19 @@ class WeType : public InputMethodEngineV2 {
     std::string text;
   };
   TextBatch *textBatch_ = nullptr;
+  struct ReplayView {
+    InputContext *context = nullptr;
+    std::string text;
+    unsigned cursor = 0;
+  };
+  ReplayView *replayView_ = nullptr;
   std::map<uint64_t, TrackableObjectReference<InputContext>> contexts_;
   pid_t child_ = -1;
   int read_ = -1, write_ = -1;
   std::unique_ptr<EventSourceIO> reader_, writer_;
-  std::unique_ptr<EventSourceTime> timer_, numericTimer_, cursorTimer_;
+  std::unique_ptr<EventSourceTime> timer_, cursorTimer_;
   std::unique_ptr<HandlerTableEntry<EventHandler>> languageModifierWatcher_;
-  std::unique_ptr<HandlerTableEntry<EventHandler>> numericWatcher_;
+  std::unique_ptr<HandlerTableEntry<EventHandler>> surroundingWatcher_;
   bool ready_ = false, failed_ = false, backendUpdates_ = false;
   uint64_t activity_ = 0;
   uint64_t restartAt_ = 0, restartBackoff_ = 250000;
@@ -419,8 +435,12 @@ class WeType : public InputMethodEngineV2 {
     return std::string_view(ic->frontend()) == "wayland_v2";
   }
   static bool virtualKeyboardCursor(InputContext *ic) {
-    // GNOME's IBus bridge also forwards keys through a Wayland keyboard.
-    return waylandV2(ic) || std::string_view(ic->frontend()) == "ibus";
+    // KWin uses the v1 frontend ("wayland"). Both native protocols and
+    // GNOME's IBus bridge need ordering against the physical modifiers and
+    // the client's asynchronous cursor updates.
+    const std::string_view frontend = ic->frontend();
+    return frontend == "wayland" || frontend == "wayland_v2" ||
+           frontend == "ibus";
   }
   static bool legacyClientKeys(InputContext *ic) {
     return std::string_view(ic->frontend()) == "dbus" &&
@@ -478,15 +498,20 @@ class WeType : public InputMethodEngineV2 {
   }
   static void clearCursorMove(State *s) {
     s->pendingCursorSteps = 0;
-    s->pendingClientKey = s->pendingNumericReplay = false;
+    s->pendingClientKey = false;
     s->clientExpected.clear();
     s->clientCursorReplay = false;
+    s->clientRequireChange = false;
+    s->clientResetPending = false;
     s->cursorDeadline = 0;
     s->cursorReplayAt = 0;
     s->cursorTarget = -1;
     s->cursorExpected.clear();
     s->cursorPrefix.clear();
     s->cursorHadView = false;
+    s->cursorResetPending = false;
+    s->cursorMoveReset = false;
+    s->cursorViewAcknowledged = false;
     s->cursorKeys.clear();
   }
   void scheduleCursorMove() {
@@ -499,13 +524,14 @@ class WeType : public InputMethodEngineV2 {
   // Prefer its text acknowledgement; clients without one get a client turn.
   void waitForClient(InputContext *ic, State *s,
                      const std::string &expected = {},
-                     bool cursorReplay = false) {
+                     bool cursorReplay = false, bool requireChange = false) {
     flushTextBatch(ic);
     const auto &text = ic->surroundingText();
     s->pendingClientKey = true;
-    s->pendingNumericReplay = false;
     s->clientExpected = expected;
     s->clientCursorReplay = cursorReplay;
+    s->clientRequireChange = requireChange;
+    s->clientResetPending = false;
     s->clientHadText =
         ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
         text.isValid();
@@ -530,9 +556,9 @@ class WeType : public InputMethodEngineV2 {
     const auto viewHash = std::hash<std::string>{}(view.text());
     flushTextBatch(ic);
     clearSpacing(s);
-    // Wayland virtual keyboards inherit physical modifiers even
-    // when forwardKey requests none. Wait for their real release rather
-    // than sending Shift+Left and selecting the closing bracket.
+    // Order native cursor events after the client applies the insertion.
+    // Virtual-keyboard protocols also need the physical modifiers released;
+    // Wayland v1 keysym events carry their own modifier mask.
     if (virtualKeyboardCursor(ic) || legacyClientKeys(ic)) {
       s->pendingClientKey = false;
       s->clientExpected.clear();
@@ -546,6 +572,8 @@ class WeType : public InputMethodEngineV2 {
       s->cursorDeadline = 0;
       s->cursorReplayAt = 0;
       s->cursorTarget = -1;
+      s->cursorResetPending = s->cursorMoveReset = false;
+      s->cursorViewAcknowledged = steps > 0 && prefix.empty();
       scheduleCursorMove();
       return;
     }
@@ -564,8 +592,24 @@ class WeType : public InputMethodEngineV2 {
         ic->forwardKey(key, true);
     }
   }
+  void recordReplayCommit(InputContext *ic, const std::string &text) {
+    if (!replayView_ || replayView_->context != ic)
+      return;
+    auto &view = *replayView_;
+    const auto length = text.empty() ? 0 : utf8::lengthValidated(text);
+    if (length == utf8::INVALID_LENGTH) {
+      view.context = nullptr;
+      return;
+    }
+    const auto byte = view.cursor
+                          ? utf8::ncharByteLength(view.text.begin(), view.cursor)
+                          : 0;
+    view.text.insert(size_t(byte), text);
+    view.cursor += length;
+  }
   void commitText(InputContext *ic, const std::string &text) {
     if (!textBatch_ || textBatch_->context.get() != ic) {
+      recordReplayCommit(ic, text);
       ic->commitString(text);
       return;
     }
@@ -576,6 +620,7 @@ class WeType : public InputMethodEngineV2 {
           applyAutoSpace(value, textBatch_->text.empty() ? beforeWindow(ic, s)
                                                          : textBatch_->text);
     textBatch_->text += value;
+    recordReplayCommit(ic, value);
   }
   void flushTextBatch(InputContext *ic) {
     if (!textBatch_ || textBatch_->context.get() != ic ||
@@ -632,6 +677,13 @@ class WeType : public InputMethodEngineV2 {
           if (!key.release) {
             if (key.key.sym() == FcitxKey_BackSpace) {
               const auto length = utf8::length(batch.text);
+              if (replayView_ && replayView_->context == target && replayView_->cursor) {
+                auto &view = *replayView_;
+                const auto last = utf8::ncharByteLength(view.text.begin(), view.cursor);
+                const auto first = utf8::ncharByteLength(view.text.begin(), view.cursor - 1);
+                view.text.erase(size_t(first), size_t(last - first));
+                --view.cursor;
+              }
               batch.text.resize(
                   utf8::ncharByteLength(batch.text.begin(), length - 1));
             } else {
@@ -648,7 +700,6 @@ class WeType : public InputMethodEngineV2 {
               state(target)->cursorKeys.push_back(key);
               continue;
             }
-            clearNumericCorrection(state(target));
             state(target)->symbolAutoState = !batch.text.empty() &&
                                                      batch.text.back() >= '0' &&
                                                      batch.text.back() <= '9'
@@ -693,7 +744,8 @@ class WeType : public InputMethodEngineV2 {
     if (!s->pendingCursorSteps && !s->pendingClientKey)
       return false;
     if (!s->active || !ic->hasFocus() ||
-        ic->capabilityFlags().test(CapabilityFlag::Password)) {
+        ic->capabilityFlags().test(CapabilityFlag::Password) ||
+        ic->capabilityFlags().test(CapabilityFlag::Sensitive)) {
       releaseForwardedKeys(ic, s);
       clearCursorMove(s);
       return false;
@@ -701,16 +753,22 @@ class WeType : public InputMethodEngineV2 {
     const auto time = now(CLOCK_MONOTONIC);
     const auto &surrounding = ic->surroundingText();
     if (s->pendingClientKey) {
+      const bool viewChanged =
+          s->clientHadText && surrounding.isValid() &&
+          (surrounding.cursor() != s->clientCursor ||
+           surrounding.anchor() != s->clientAnchor ||
+           std::hash<std::string>{}(surrounding.text()) != s->clientTextHash);
       const bool acknowledged =
           !s->clientExpected.empty()
-              ? previousTextIs(ic, s->clientExpected)
-              : s->clientHadText && surrounding.isValid() &&
-                    (surrounding.cursor() != s->clientCursor ||
-                     surrounding.anchor() != s->clientAnchor ||
-                     std::hash<std::string>{}(surrounding.text()) !=
-                         s->clientTextHash);
+              ? previousTextIs(ic, s->clientExpected) &&
+                    (!s->clientRequireChange || viewChanged)
+              : viewChanged;
       if (!acknowledged && time < s->cursorReplayAt)
         return true;
+      if (!acknowledged && s->clientResetPending) {
+        clearCursorMove(s);
+        return false;
+      }
       auto keys = std::move(s->cursorKeys);
       const auto cursorReplay = s->clientCursorReplay;
       clearCursorMove(s);
@@ -718,17 +776,46 @@ class WeType : public InputMethodEngineV2 {
       return s->pendingCursorSteps || s->pendingClientKey;
     }
     if (s->cursorReplayAt) {
-      const bool acknowledged = s->cursorTarget >= 0 && surrounding.isValid() &&
-          surrounding.cursor() == surrounding.anchor() &&
+      const auto context = symbolContext(ic);
+      const bool sameText = s->cursorHadView &&
+          context.valid && context.selected.empty() &&
+          std::hash<std::string>{}(surrounding.text()) == s->cursorViewHash;
+      const bool acknowledged = sameText && s->cursorTarget >= 0 &&
           int64_t(surrounding.cursor()) == s->cursorTarget;
       if (!acknowledged && time < s->cursorReplayAt)
         return true;
+      if (!acknowledged && s->cursorHadView && !s->cursorMoveReset &&
+          time < s->cursorDeadline)
+        return true;
+      ReplayView moved;
+      if (acknowledged) {
+        moved = {ic, surrounding.text(), surrounding.cursor()};
+      } else if (s->cursorMoveReset && sameText && s->cursorTarget >= 0 &&
+          surrounding.cursor() == s->cursorViewCursor &&
+          uint64_t(s->cursorTarget) <= utf8::length(surrounding.text())) {
+        // Some GTK clients reset after our Left key, but only publish that
+        // new caret on the next physical key. Scope the confirmed text and
+        // our own ordered movement to this replay; never alter the client's
+        // surrounding-text cache or infer context for an opaque client.
+        moved = {ic, surrounding.text(), unsigned(s->cursorTarget)};
+      } else if (!acknowledged && s->cursorResetPending && s->cursorHadView) {
+        clearCursorMove(s);
+        return false;
+      }
       auto keys = std::move(s->cursorKeys);
       clearCursorMove(s);
+      ScopedRestore<ReplayView *> restoreView(replayView_);
+      if (moved.context)
+        replayView_ = &moved;
       replayDeferredKeys(ic, std::move(keys), true);
       return s->pendingCursorSteps || s->pendingClientKey;
     }
-    if (modifiersHeld(instance_, ic, s))
+    // Only virtual keyboards inherit the physical modifier mask. Wayland
+    // v1 and Qt D-Bus cursor events carry an explicit empty mask, including
+    // the Qt fallback used before a blank document has surrounding text.
+    const std::string_view frontend = ic->frontend();
+    if ((frontend == "wayland_v2" || frontend == "ibus") &&
+        modifiersHeld(instance_, ic, s))
       return true;
     if (!s->cursorDeadline)
       s->cursorDeadline = time + 250000;
@@ -741,6 +828,7 @@ class WeType : public InputMethodEngineV2 {
         std::hash<std::string>{}(surrounding.text()) != s->cursorViewHash;
     const bool prefixApplied =
         !s->cursorHadView ||
+        !ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
         (surrounding.isValid() &&
          (s->cursorPrefix.empty() || previousTextIs(ic, s->cursorPrefix)) &&
          ((s->pendingCursorSteps >= 0 && s->cursorPrefix.empty()) ||
@@ -749,7 +837,9 @@ class WeType : public InputMethodEngineV2 {
       return true;
     // Terminals can support native input without exposing surrounding text.
     // With no text to compare, preserve the ordered cursor-key fallback.
-    const bool hasText = surrounding.isValid() && !surrounding.text().empty();
+    const bool hasText =
+        ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+        surrounding.isValid() && !surrounding.text().empty();
     bool matches = prefixApplied &&
                    (!hasText || surrounding.cursor() == surrounding.anchor());
     if (matches && hasText) {
@@ -769,6 +859,12 @@ class WeType : public InputMethodEngineV2 {
     const int steps = s->pendingCursorSteps;
     // A click, selection or context change must not receive a late movement.
     if (matches) {
+      s->cursorHadView = hasText;
+      s->cursorViewHash = std::hash<std::string>{}(surrounding.text());
+      s->cursorViewCursor = surrounding.cursor();
+      s->cursorMoveReset = false;
+      s->cursorViewAcknowledged = false;
+      s->cursorDeadline = time + 250000;
       emitCursor(ic, steps);
       // Cursor keys and IM commits use different Wayland protocols. Give
       // the client a turn to apply the key before replaying nested pairs or
@@ -778,9 +874,37 @@ class WeType : public InputMethodEngineV2 {
       return true;
     }
     auto keys = std::move(s->cursorKeys);
+    const bool reset = s->cursorResetPending;
     clearCursorMove(s);
-    replayDeferredKeys(ic, std::move(keys), true);
+    if (!reset)
+      replayDeferredKeys(ic, std::move(keys), true);
     return s->pendingCursorSteps || s->pendingClientKey;
+  }
+  void acknowledgeCursorView(InputContext *ic, State *s) {
+    if (!s->pendingCursorSteps || replayView_)
+      return;
+    const auto context = symbolContext(ic);
+    if (!context.valid || !context.selected.empty())
+      return;
+    const auto &view = ic->surroundingText();
+    const auto hash = std::hash<std::string>{}(view.text());
+    if (s->cursorReplayAt) {
+      if (s->cursorTarget >= 0 && int64_t(view.cursor()) == s->cursorTarget &&
+          hash == s->cursorViewHash)
+        s->cursorViewAcknowledged = true;
+    } else if (!s->cursorExpected.empty()) {
+      const bool changed = view.cursor() != s->cursorViewCursor ||
+                           view.anchor() != s->cursorViewAnchor ||
+                           hash != s->cursorViewHash;
+      const bool matches = s->pendingCursorSteps < 0
+                               ? previousTextIs(ic, s->cursorExpected)
+                               : nextSurroundingTextIs(ic, s->cursorExpected) &&
+                                     (s->cursorPrefix.empty() ||
+                                      previousTextIs(ic, s->cursorPrefix));
+      if (matches &&
+          (changed || (s->pendingCursorSteps > 0 && s->cursorPrefix.empty())))
+        s->cursorViewAcknowledged = true;
+    }
   }
   void startSync() {
     if (runtimePhase_ != RuntimePhase::Idle)
@@ -817,6 +941,58 @@ class WeType : public InputMethodEngineV2 {
        symbolAutoChange_ = true, clipboardEnabled_ = false,
        networkEnabled_ = true;
   wetype_config::WeTypeConfig config_;
+  wire::Json engineSettings_;
+  using IdentityStamp =
+      std::tuple<dev_t, ino_t, off_t, time_t, long, time_t, long>;
+  std::optional<IdentityStamp> backendIdentity_;
+  std::optional<IdentityStamp> identityStamp() const {
+    const char *directory = getenv("WETYPE_ACCOUNT_STATE_DIR");
+    const auto path = (directory ? std::filesystem::path(directory)
+                                 : runtimeRoot() / "account") / "identity.json";
+    struct stat info{};
+    if (stat(path.c_str(), &info) == 0)
+      return IdentityStamp{info.st_dev, info.st_ino, info.st_size,
+                           info.st_mtim.tv_sec, info.st_mtim.tv_nsec,
+                           info.st_ctim.tv_sec, info.st_ctim.tv_nsec};
+    if (errno == ENOENT)
+      return IdentityStamp{};
+    return std::nullopt;
+  }
+  bool frontendOnly(const wetype_config::WeTypeConfig &before) const {
+    if (before == config_ || child_ <= 0 || failed_ ||
+        runtimePhase_ != RuntimePhase::Idle || !backendIdentity_ ||
+        backendIdentity_ != identityStamp())
+      return false;
+    auto comparable = config_;
+    auto *appearance = comparable.appearance.mutableValue();
+    appearance->pageSize.setValue(*before.appearance->pageSize);
+    appearance->vertical.setValue(*before.appearance->vertical);
+    appearance->preeditPosition.setValue(*before.appearance->preeditPosition);
+    appearance->labelStyle.setValue(*before.appearance->labelStyle);
+    appearance->candidateSize.setValue(*before.appearance->candidateSize);
+    appearance->theme.setValue(*before.appearance->theme);
+    auto *input = comparable.input.mutableValue();
+    input->chinesePunctuation.setValue(*before.input->chinesePunctuation);
+    input->rememberPunctuation.setValue(*before.input->rememberPunctuation);
+    comparable.voice.mutableValue()->provider.setValue(*before.voice->provider);
+    comparable.voice.mutableValue()->localModel.setValue(*before.voice->localModel);
+    return comparable == before;
+  }
+  void refreshPresentation() {
+    for (const auto &[id, ref] : contexts_)
+      if (auto *ic = ref.get()) {
+        auto *s = ic->propertyFor(&factory_);
+        if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
+          continue;
+        s->candidatePage = s->candidateCursor / pageSize_;
+        if (s->vMenu != VMenu::None)
+          updateVMenu(ic, s);
+        else
+          updateCandidates(ic, s);
+        panel(ic, s);
+        ic->updateUserInterface(UserInterfaceComponent::StatusArea);
+      }
+  }
   std::optional<wetype::EnglishDictionary> englishDictionary_;
   std::filesystem::path stateDirectory() const {
     const char *state = getenv("WETYPE_STATE_DIR"),
@@ -847,51 +1023,82 @@ class WeType : public InputMethodEngineV2 {
   }
   bool nextSurroundingTextIs(InputContext *ic,
                              const std::string &expected) const {
-    const auto &surrounding = ic->surroundingText();
-    if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor())
-      return false;
-    const auto &text = surrounding.text();
-    auto byte = utf8::ncharByteLength(text.begin(), surrounding.cursor());
-    return byte >= 0 && size_t(byte) <= text.size() &&
-           text.compare(size_t(byte), expected.size(), expected) == 0;
+    const auto context = symbolContext(ic);
+    return context.valid && context.selected.empty() &&
+           context.after.compare(0, expected.size(), expected) == 0;
   }
-  // Confirm a committed suffix at the actual, unselected caret. Numeric
-  // replacement additionally requires its leading digit to be unchanged.
-  static bool previousTextIs(InputContext *ic, const std::string &expected,
-                             bool numeric = false) {
-    const auto &surrounding = ic->surroundingText();
-    if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor())
-      return false;
-    const auto &text = surrounding.text();
-    auto byte = utf8::ncharByteLength(text.begin(), surrounding.cursor());
-    return byte >= 0 && size_t(byte) <= text.size() &&
-           size_t(byte) >= expected.size() &&
-           (!numeric || (size_t(byte) > expected.size() &&
-                         text[size_t(byte) - expected.size() - 1] >= '0' &&
-                         text[size_t(byte) - expected.size() - 1] <= '9')) &&
-           text.compare(size_t(byte) - expected.size(), expected.size(),
-                        expected) == 0;
+  struct SymbolContext {
+    bool valid = false;
+    std::string_view before, selected, after;
+  };
+  SymbolContext symbolContext(InputContext *ic) const {
+    const auto &view = ic->surroundingText();
+    const bool replay = replayView_ && replayView_->context == ic;
+    if (!ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
+        (!replay && !view.isValid()))
+      return {};
+    const auto cursor = replay ? replayView_->cursor : view.cursor();
+    const auto anchor = replay ? cursor : view.anchor();
+    const auto &value = replay ? replayView_->text : view.text();
+    const auto begin = std::min(cursor, anchor);
+    const auto end = std::max(cursor, anchor);
+    const auto length = value.empty() ? 0 : utf8::lengthValidated(value);
+    if (length == utf8::INVALID_LENGTH || end > length)
+      return {};
+    const auto first = begin ? utf8::ncharByteLength(value.begin(), begin) : 0;
+    const auto last = end ? utf8::ncharByteLength(value.begin(), end) : 0;
+    const std::string_view text(value);
+    return {true, text.substr(0, first), text.substr(first, last - first),
+            text.substr(last)};
   }
-  static const char *numericPunctuation(char ascii) {
-    return ascii == ':' ? "：" : ascii == ',' ? "，" : "。";
+  static bool symbolWhitespace(char32_t c) {
+    // Foundation CharacterSet.whitespacesAndNewlines, used by the original
+    // isCursorEndOrSelected before enabling automatic symbol pairing.
+    return (c >= 0x9 && c <= 0xd) || c == 0x20 || c == 0x85 || c == 0xa0 ||
+           c == 0x1680 || (c >= 0x2000 && c <= 0x200a) || c == 0x2028 ||
+           c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000;
   }
-  static void clearNumericCorrection(State *s) {
-    s->pendingNumericText.clear();
-    s->pendingNumericReplacement.clear();
-    s->pendingNumericUntil = 0;
+  static bool symbolPairPosition(const SymbolContext &context) {
+    return !context.valid || !context.selected.empty() || context.after.empty() ||
+           symbolWhitespace(utf8::getChar(context.after.begin(), context.after.end()));
   }
-  static char numericReplacement(uint8_t state) {
-    return state == 1 ? ':' : state == 2 ? ',' : state == 4 ? '.' : 0;
-  }
-  static void appendNumericCorrection(State *s, const std::string &text) {
-    if (s->pendingNumericText.empty())
-      return;
-    if (s->pendingNumericText.size() + text.size() > 1024) {
-      clearNumericCorrection(s);
-      return;
+  static bool quoteOpens(const SymbolContext &context, const std::string &left,
+                         const std::string &right, bool fallback) {
+    if (!context.valid)
+      return fallback;
+    // Original CharMapHelper searches backwards on the current line. An
+    // existing opening quote selects the closing form, which is inserted
+    // literally even when an automatically inserted closer follows it.
+    const auto opening = utf8::getChar(left.begin(), left.end());
+    const auto closing = utf8::getChar(right.begin(), right.end());
+    for (size_t end = context.before.size(); end;) {
+      auto begin = end - 1;
+      while (begin && (static_cast<unsigned char>(context.before[begin]) & 0xc0) == 0x80)
+        --begin;
+      const auto c = utf8::getChar(context.before.begin() + begin,
+                                   context.before.begin() + end);
+      if ((c >= 0xa && c <= 0xd) || c == 0x85 || c == 0x2028 || c == 0x2029)
+        return true;
+      // outputRightOfPair in the original retains a pending single opening
+      // quote. A new line overrides it; selections use that pending state
+      // without searching the text being replaced.
+      if (!context.selected.empty() || !fallback)
+        return fallback;
+      else if (c == closing)
+        return true;
+      else if (c == opening)
+        return false;
+      end = begin;
     }
-    s->pendingNumericText += text;
-    s->pendingNumericReplacement += text;
+    return true;
+  }
+  // Confirm a committed suffix at the actual, unselected caret.
+  bool previousTextIs(InputContext *ic, const std::string &expected) const {
+    const auto context = symbolContext(ic);
+    return context.valid && context.selected.empty() &&
+           context.before.size() >= expected.size() &&
+           context.before.compare(context.before.size() - expected.size(),
+                                  expected.size(), expected) == 0;
   }
   static bool numericKeyTransport(InputContext *ic) {
     // KeyEventOrderFix also appears in GTK clients such as Chromium, whose
@@ -906,7 +1113,7 @@ class WeType : public InputMethodEngineV2 {
     // Preserve the original native key and its layout/modifier state for
     // ASCII. A manufactured colon without Shift becomes a semicolon in GTK.
     const bool orderedAscii =
-        legacyClientKeys(ic) && currentKeyEvent_ &&
+        (legacyClientKeys(ic) || numericKeyTransport(ic)) && currentKeyEvent_ &&
         currentKeyEvent_->inputContext() == ic && text.size() == 1 &&
         static_cast<unsigned char>(text.front()) >= 0x20 &&
         static_cast<unsigned char>(text.front()) <= 0x7e &&
@@ -948,60 +1155,37 @@ class WeType : public InputMethodEngineV2 {
       }
     }
   }
-  void scheduleNumericCorrection() {
-    if (!numericTimer_)
+  void flushNumericPreview(InputContext *ic, State *s, bool commit = true) {
+    if (s->numericPreview.empty())
       return;
-    const auto wake = now(CLOCK_MONOTONIC) + 1;
-    if (!numericTimer_->isEnabled() || numericTimer_->time() > wake)
-      numericTimer_->setTime(wake);
-    numericTimer_->setEnabled(true);
+    auto text = std::move(s->numericPreview);
+    s->numericPreview.clear();
+    s->symbolAutoState = 0;
+    ic->inputPanel().setClientPreedit(Text());
+    ic->updatePreedit();
+    if (commit)
+      commitText(ic, text);
   }
-  void resolveNumericCorrection(InputContext *ic, State *s) {
-    if (s->pendingNumericText.empty()) {
-      if (s->pendingNumericReplay)
-        waitForClient(ic, s);
-      return;
-    }
-    if (!s->active || !ic->hasFocus() || !symbolAutoChange_ || s->english ||
-        englishPunctuation(s) || s->fullWidth ||
-        voicePending_ || s->vMode || s->vMenu != VMenu::None ||
-        !s->preedit.empty() ||
-        ic->capabilityFlags().test(CapabilityFlag::Password) ||
-        ic->capabilityFlags().test(CapabilityFlag::Sensitive) ||
-        now(CLOCK_MONOTONIC) > s->pendingNumericUntil) {
-      clearNumericCorrection(s);
-      if (s->pendingNumericReplay)
-        waitForClient(ic, s);
-      return;
-    }
-    const auto &expected = s->pendingNumericText;
-    if (!previousTextIs(ic, expected, true))
-      return;
-    const auto replacement = s->pendingNumericReplacement;
-    const int length = int(utf8::length(expected));
-    clearNumericCorrection(s);
-    if (numericKeyTransport(ic)) {
-      for (int i = 0; i < length; ++i) {
-        ic->forwardKey(Key(FcitxKey_BackSpace));
-        ic->forwardKey(Key(FcitxKey_BackSpace), true);
+  void finishNumericPreviews() {
+    for (const auto &[id, ref] : contexts_)
+      if (auto *ic = ref.get()) {
+        auto *s = ic->propertyFor(&factory_);
+        flushNumericPreview(ic, s, s->active && ic->hasFocus() &&
+            !ic->capabilityFlags().test(CapabilityFlag::Password) &&
+            !ic->capabilityFlags().test(CapabilityFlag::Sensitive));
       }
-    } else {
-      ic->deleteSurroundingText(-length, length);
-    }
-    deliverNumericText(ic, state(ic), replacement);
-    if (s->pendingNumericReplay)
-      waitForClient(ic, s, replacement);
   }
   std::string mappedSymbol(State *s, char ascii, bool asciiMode) const {
     const auto *entry = punctuationEntry(ascii);
     if (!entry)
       return std::string(1, ascii);
-    const bool useEnglish =
-        asciiMode || englishPunctuation(s);
-    if (ascii == '/' && slashPunctuation_ && !useEnglish && !s->fullWidth)
-      return "、";
+    // Original CharMapHelper chooses full-width symbols by input language.
+    // The punctuation preference applies only in the default character form.
     if (s->fullWidth)
-      return useEnglish ? entry->englishFull : entry->full;
+      return asciiMode ? entry->englishFull : entry->full;
+    const bool useEnglish = asciiMode || englishPunctuation(s);
+    if (ascii == '/' && slashPunctuation_ && !useEnglish)
+      return "、";
     if (useEnglish)
       return entry->englishHalf;
     return entry->normal;
@@ -1106,6 +1290,15 @@ class WeType : public InputMethodEngineV2 {
     return output;
   }
   void trackPassedKey(InputContext *ic, State *s, const KeyEvent &event) {
+    // Remember only physical presses that Wayland v2 will pass to the
+    // client. Buffered presses are committed as text and own no held key.
+    if (waylandV2(ic) && !replayingKeys_ && !event.isRelease() &&
+        !event.key().isModifier() && !event.filtered() && !event.accepted() &&
+        std::none_of(s->forwardedKeys.begin(), s->forwardedKeys.end(),
+                     [&](const Key &key) {
+                       return samePhysicalKey(key, event.rawKey());
+                     }))
+      s->forwardedKeys.push_back(event.rawKey());
     const auto modifiers = event.key().states().toInteger() &
                            uint32_t(KeyState::SimpleMask) &
                            ~uint32_t(KeyState::Shift);
@@ -1113,7 +1306,6 @@ class WeType : public InputMethodEngineV2 {
     if (!event.isRelease() && !event.key().isModifier() && !event.filtered() &&
         !event.accepted() && (modifiers || scalar < 0x20 || scalar == 0x7f)) {
       s->symbolAutoState = 0;
-      clearNumericCorrection(s);
     }
     if (!event.isRelease() && !event.key().isModifier() && !event.filtered() &&
         !event.accepted() && !replayingForwarded_ && legacyClientKeys(ic) &&
@@ -1144,6 +1336,16 @@ class WeType : public InputMethodEngineV2 {
                                    size_t cursor) {
     if (textBatch_ && textBatch_->context.get() == ic &&
         !textBatch_->text.empty()) {
+      if (replayView_ && replayView_->context == ic) {
+        auto &view = *replayView_;
+        const auto byte = utf8::ncharByteLength(view.text.begin(), view.cursor);
+        const auto &prefix = textBatch_->text;
+        if (size_t(byte) >= prefix.size() &&
+            view.text.compare(size_t(byte) - prefix.size(), prefix.size(), prefix) == 0) {
+          view.text.erase(size_t(byte) - prefix.size(), prefix.size());
+          view.cursor -= utf8::length(prefix);
+        }
+      }
       auto combined = std::move(textBatch_->text);
       textBatch_->text.clear();
       const auto position = utf8::length(combined) + cursor;
@@ -1157,6 +1359,9 @@ class WeType : public InputMethodEngineV2 {
     cursor = std::min(cursor, length);
     if constexpr (HasCursorCommit<Context, Flag>::value) {
       if (ic->capabilityFlags().test(Flag::CommitStringWithCursor)) {
+        recordReplayCommit(ic, text);
+        if (replayView_ && replayView_->context == ic)
+          replayView_->cursor -= length - cursor;
         ic->commitStringWithCursor(text, cursor);
         // The caret now sits inside the pair, so the character before it, not
         // the pair's last character, is what the next commit follows.
@@ -1168,50 +1373,44 @@ class WeType : public InputMethodEngineV2 {
     // XIM and some Wayland text-input clients cannot express a cursor inside
     // committed text. Commit the complete pair first, then reproduce the
     // original desktop behavior with ordinary cursor movement.
+    recordReplayCommit(ic, text);
     ic->commitString(text);
     forwardCursor(ic, state(ic), -int(length - cursor), text);
     rememberSpacing(ic, state(ic), lastScalarBefore(text, cursor));
   }
-  void rememberPair(InputContext *ic, State *s, char opening,
-                    const std::string &right) {
-    if (s->pendingPairKey && (nextSurroundingTextIs(ic, s->pendingPairRight) ||
-                              (replayingCursor_ && legacyClientKeys(ic))))
-      s->outerPairs.emplace_back(s->pendingPairKey, s->pendingPairRight);
-    else
-      s->outerPairs.clear();
+  static void rememberPair(State *s, char opening,
+                           const std::string &right) {
     s->pendingPairKey = closingKey(opening);
     s->pendingPairRight = right;
   }
   static void finishPair(State *s) {
-    if (s->outerPairs.empty()) {
-      s->pendingPairKey = 0;
-      s->pendingPairRight.clear();
-    } else {
-      s->pendingPairKey = s->outerPairs.back().first;
-      s->pendingPairRight = std::move(s->outerPairs.back().second);
-      s->outerPairs.pop_back();
-    }
+    s->pendingPairKey = 0;
+    s->pendingPairRight.clear();
   }
   bool commitSymbol(InputContext *ic, State *s, char ascii, bool asciiMode) {
     const auto *entry = punctuationEntry(ascii);
     if (!entry)
       return false;
-    if (s->pendingPairKey == ascii && !s->pendingPairRight.empty() &&
-        (nextSurroundingTextIs(ic, s->pendingPairRight) ||
-         (replayingCursor_ && legacyClientKeys(ic)))) {
+    const auto context = symbolContext(ic);
+    if (!asciiMode && !entry->pairType && s->pendingPairKey == ascii &&
+        !s->pendingPairRight.empty() &&
+        mappedSymbol(s, ascii, false) == s->pendingPairRight &&
+        nextSurroundingTextIs(ic, s->pendingPairRight)) {
       forwardCursor(ic, s, 1, s->pendingPairRight);
       finishPair(s);
-      clearNumericCorrection(s);
       s->symbolAutoState = 0;
       return true;
     }
+    // Chinese CharMapHelper remembers one most recently generated right
+    // symbol and clears it when processing another mapped Chinese symbol.
+    if (!asciiMode)
+      finishPair(s);
     const bool autoChangeActive = symbolAutoChange_ && !asciiMode &&
                                   !englishPunctuation(s) &&
                                   !s->fullWidth;
-    const bool numeric = autoChangeActive &&
-                         (s->symbolAutoState || !s->pendingNumericText.empty());
+    const bool numeric = autoChangeActive && s->symbolAutoState;
     auto emit = [&](const std::string &value) {
-      if (numeric)
+      if (numeric || (!asciiMode && !s->fullWidth && numericKeyTransport(ic)))
         deliverNumericText(ic, s, value);
       else
         commitText(ic, value);
@@ -1220,34 +1419,57 @@ class WeType : public InputMethodEngineV2 {
       if (!value.empty())
         rememberSpacing(ic, s, lastScalar(value));
     };
-    // Without client text there is no safe suffix to replace later. Insert
-    // numeric separators as ASCII immediately, including the trailing dot.
+    // A client without native preedit cannot own a temporary separator.
+    // Keep the established literal ASCII fallback instead of rewriting text.
     const bool numericAscii =
         autoChangeActive && s->symbolAutoState == 3 &&
-        !ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+        (!ic->capabilityFlags().test(CapabilityFlag::Preedit) ||
+         !ic->isPreeditEnabled()) &&
         (ascii == '.' || ascii == ',' || ascii == ':');
     std::string mapped = numericAscii ? std::string(1, ascii)
                                       : mappedSymbol(s, ascii, asciiMode);
-    if (autoChangeActive && !entry->pairType)
-      appendNumericCorrection(s, mapped);
+    if (autoChangeActive && s->symbolAutoState == 3 &&
+        ic->capabilityFlags().test(CapabilityFlag::Preedit) &&
+        ic->isPreeditEnabled() &&
+        (ascii == '.' || ascii == ',' || ascii == ':')) {
+      // Native preedit owns the tentative separator. The next key commits
+      // its final form once; no timer deletes previously committed text.
+      flushTextBatch(ic);
+      s->numericPreview = mapped;
+      Text preview(mapped);
+      preview.setCursor(mapped.size());
+      ic->inputPanel().setClientPreedit(preview);
+      ic->updatePreedit();
+      s->symbolAutoState = 0;
+      return true;
+    }
     auto [left, right] = splitPair(mapped);
     if (entry->pairType && !right.empty()) {
-      if (*config_.input->symbolAutoPair) {
-        rememberPair(ic, s, ascii, right);
+      if (asciiMode) {
+        // getAppositeCharInEngMode returns the first mapped character only.
+        emit(left);
+      } else if (*config_.input->symbolAutoPair && symbolPairPosition(context)) {
+        mapped = left + std::string(context.selected) + right;
+        rememberPair(s, ascii, right);
         if (numeric && numericKeyTransport(ic)) {
           emit(mapped);
-          for (size_t i = 1; i < utf8::length(mapped); ++i) {
-            ic->forwardKey(Key(FcitxKey_Left));
-            ic->forwardKey(Key(FcitxKey_Left), true);
-          }
+          ic->forwardKey(Key(FcitxKey_Left));
+          ic->forwardKey(Key(FcitxKey_Left), true);
         } else {
-          commitStringAtCursor(ic, mapped, 1);
+          commitStringAtCursor(ic, mapped, utf8::length(mapped) - 1);
         }
       } else if (entry->pairType == 2) {
         bool &leftNext =
             ascii == '\"' ? s->doubleQuoteLeft : s->singleQuoteLeft;
-        emit(leftNext ? left : right);
-        leftNext = !leftNext;
+        const bool opening = quoteOpens(context, left, right, leftNext);
+        emit(opening ? left : right);
+        leftNext = !opening;
+        // Fast physical keys can arrive before a Wayland client applies the
+        // previous quote. Use its updated text for the next decision, even
+        // if the old suffix happens to be the same ASCII quote character.
+        if (context.valid && (!replayView_ || replayView_->context != ic) &&
+            (virtualKeyboardCursor(ic) || replayingKeys_))
+          waitForClient(ic, s, opening ? left : right, replayingCursor_, true);
       } else {
         emit(left);
       }
@@ -1255,24 +1477,74 @@ class WeType : public InputMethodEngineV2 {
       emit(mapped);
     }
 
-    if (numericAscii)
-      s->symbolAutoState = 0;
-    else if (autoChangeActive && s->symbolAutoState == 3 && ascii == ':')
-      s->symbolAutoState = 1;
-    else if (autoChangeActive && s->symbolAutoState == 3 && ascii == ',')
-      s->symbolAutoState = 2;
-    else if (autoChangeActive && s->symbolAutoState == 3 && ascii == '.')
-      s->symbolAutoState = 4;
-    else
-      s->symbolAutoState = 0;
+    s->symbolAutoState = 0;
+    return true;
+  }
+  static std::filesystem::path configPath() {
+    const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    return (config && *config ? std::filesystem::path(config)
+                             : std::filesystem::path(home ? home : "") / ".config") /
+           "fcitx5/wetypex.json";
+  }
+  static bool storeSettings(json_object *settings) {
+    const auto path = configPath();
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    if (error)
+      return false;
+    const auto bytes = wire::dump(settings) + '\n';
+    if (bytes.size() > 16384)
+      return false;
+    auto temporary = path.string() + ".XXXXXX";
+    const int fd = mkostemp(temporary.data(), O_CLOEXEC);
+    if (fd < 0)
+      return false;
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+      const auto count = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+      if (count > 0)
+        offset += size_t(count);
+      else if (count < 0 && errno == EINTR)
+        continue;
+      else
+        break;
+    }
+    const bool closed = close(fd) == 0;
+    if (offset == bytes.size() && closed &&
+        ::rename(temporary.c_str(), path.c_str()) == 0)
+      return true;
+    unlink(temporary.c_str());
+    return false;
+  }
+  void resetPunctuationOverrides() {
+    for (const auto &[id, ref] : contexts_)
+      if (auto *ic = ref.get()) {
+        auto *s = ic->propertyFor(&factory_);
+        s->englishPunctuation.reset();
+        s->symbolAutoState = 0;
+        ic->updateUserInterface(UserInterfaceComponent::StatusArea);
+      }
+  }
+  bool rememberPunctuation(bool chinese) {
+    // Patch only this preference; settings edited by another UI stay intact.
+    std::ifstream file(configPath());
+    std::string bytes(16385, '\0');
+    file.read(bytes.data(), bytes.size());
+    bytes.resize(file.gcount());
+    auto settings = bytes.size() > 16384 ? wire::Json{} : wire::parse(bytes);
+    if (!settings || !json_object_is_type(settings.get(), json_type_object))
+      return false;
+    wire::put(settings.get(), "chinese_punctuation", chinese);
+    if (!storeSettings(settings.get()))
+      return false;
+    chinesePunctuation_ = chinese;
+    config_.input.mutableValue()->chinesePunctuation.setValue(chinese);
+    resetPunctuationOverrides();
     return true;
   }
   void reloadSettings() {
-    const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-    std::string path =
-        config ? config : std::string(home ? home : "") + "/.config";
-    const auto newPath = path + "/fcitx5/wetypex.json";
-    std::ifstream f(newPath);
+    finishNumericPreviews();
+    std::ifstream f(configPath());
     std::string bytes(16385, '\0');
     f.read(bytes.data(), bytes.size());
     bytes.resize(f.gcount());
@@ -1284,16 +1556,12 @@ class WeType : public InputMethodEngineV2 {
     pageSize_ = std::clamp(int(wire::number(j.get(), "page_size", 5)), 3, 9);
     vertical_ = json_object_get_boolean(wire::get(j.get(), "vertical"));
     const bool previousPunctuation = chinesePunctuation_;
+    const bool remember = boolSetting("remember_punctuation", false);
     auto *punctuation = wire::get(j.get(), "chinese_punctuation");
     chinesePunctuation_ = !punctuation || json_object_get_boolean(punctuation);
-    if (previousPunctuation != chinesePunctuation_)
-      for (const auto &[id, ref] : contexts_)
-        if (auto *ic = ref.get()) {
-          auto *state = ic->propertyFor(&factory_);
-          state->englishPunctuation.reset();
-          state->symbolAutoState = 0;
-          clearNumericCorrection(state);
-        }
+    if (previousPunctuation != chinesePunctuation_ ||
+        remember != *config_.input->rememberPunctuation)
+      resetPunctuationOverrides();
     auto *slash = wire::get(j.get(), "slash_punctuation");
     slashPunctuation_ = !slash || json_object_get_boolean(slash);
     auto *symbolChange = wire::get(j.get(), "symbol_auto_change");
@@ -1341,6 +1609,7 @@ class WeType : public InputMethodEngineV2 {
         json_object_get_boolean(wire::get(j.get(), "symbol_auto_pair")));
     input->standalone.setValue(!networkEnabled_);
     input->chinesePunctuation.setValue(chinesePunctuation_);
+    input->rememberPunctuation.setValue(remember);
     input->defaultLanguage.setValue(
         wire::str(j.get(), "default_language") == "english"
             ? wetype_config::DefaultLanguage::English
@@ -1421,10 +1690,18 @@ class WeType : public InputMethodEngineV2 {
       auto value = wire::str(j.get(), name);
       return value.empty() ? std::string(fallback) : value;
     };
-    voice->launchKey.setValue(Key::keyListFromString(
-        stringSetting("voice_launch_key", "Control+Super+Shift_L")));
-    voice->holdKey.setValue(Key::keyListFromString(
-        stringSetting("voice_hold_key", "Control+Super_L")));
+    auto voiceKeys = [&](const char *name, const char *fallback) {
+      auto keys = Key::keyListFromString(wire::get(j.get(), name)
+                                           ? wire::str(j.get(), name)
+                                           : std::string(fallback));
+      for (auto &key : keys)
+        key = key.normalize();
+      return keys;
+    };
+    voice->launchKey.setValue(voiceKeys("voice_launch_key", "Control+Super+Shift_L"));
+    voice->holdKey.setValue(voiceKeys("voice_hold_key", "Control+Super_L"));
+    voice->provider.setValue(wire::str(j.get(), "voice_provider") == "local" ? wetype_config::VoiceProviderMode::Local : wetype_config::VoiceProviderMode::Original);
+    voice->localModel.setValue(wire::str(j.get(), "local_voice_model", "wetype"));
     voice->microphone.setValue(stringSetting("voice_microphone", "自动检测"));
     const auto voicePunctuation =
         stringSetting("voice_punctuation", "智能标点");
@@ -1477,18 +1754,16 @@ class WeType : public InputMethodEngineV2 {
     loadKeys(shortcuts->thirdCandidateKeys, "third_candidate_keys");
     config_.update.mutableValue()->autoUpdate.setValue(
         boolSetting("auto_update", true));
+    for (const char *key : {"page_size", "vertical", "preedit_position",
+                            "candidate_label_style", "candidate_size",
+                            "theme_mode", "chinese_punctuation",
+                            "remember_punctuation", "voice_provider", "local_voice_model"})
+      if (j && json_object_is_type(j.get(), json_type_object))
+        json_object_object_del(j.get(), key);
+    engineSettings_ = std::move(j);
   }
   void saveNativeConfig() {
-    const char *configHome = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-    std::filesystem::path directory =
-        configHome ? configHome
-                   : std::filesystem::path(home ? home : "") / ".config";
-    directory /= "fcitx5";
-    std::error_code error;
-    std::filesystem::create_directories(directory, error);
-    if (error)
-      return;
-    auto path = directory / "wetypex.json";
+    const auto path = configPath();
     std::ifstream oldFile(path);
     std::string oldBytes((std::istreambuf_iterator<char>(oldFile)), {});
     auto json = wire::parse(oldBytes);
@@ -1518,6 +1793,7 @@ class WeType : public InputMethodEngineV2 {
     wire::put(json.get(), "large_emoji", bool(*input.largeEmoji));
     wire::put(json.get(), "symbol_emoji", bool(*input.symbolEmoji));
     wire::put(json.get(), "chinese_punctuation", bool(*input.chinesePunctuation));
+    wire::put(json.get(), "remember_punctuation", bool(*input.rememberPunctuation));
     wire::put(json.get(), "slash_punctuation", bool(*input.slashPunctuation));
     wire::put(json.get(), "symbol_auto_change", bool(*input.symbolAutoChange));
     wire::put(json.get(), "symbol_auto_pair", bool(*input.symbolAutoPair));
@@ -1574,6 +1850,8 @@ class WeType : public InputMethodEngineV2 {
               bool(*devices.dictionarySync));
     wire::put(json.get(), "device_phrase_sync", bool(*devices.phraseSync));
     const auto &voice = *config_.voice;
+    wire::put(json.get(), "voice_provider", std::string(*voice.provider == wetype_config::VoiceProviderMode::Local ? "local" : "original"));
+    wire::put(json.get(), "local_voice_model", *voice.localModel);
     wire::put(json.get(), "voice_launch_shortcut", bool(*voice.launchShortcut));
     wire::put(json.get(), "voice_hold_shortcut", bool(*voice.holdShortcut));
     wire::put(json.get(), "voice_smart_polish", bool(*voice.smartPolish));
@@ -1625,16 +1903,12 @@ class WeType : public InputMethodEngineV2 {
     saveKeys("second_candidate_keys", shortcuts.secondCandidateKeys);
     saveKeys("third_candidate_keys", shortcuts.thirdCandidateKeys);
     wire::put(json.get(), "auto_update", bool(*config_.update->autoUpdate));
-    auto temporary = path;
-    temporary += ".tmp";
-    std::ofstream output(temporary, std::ios::trunc);
-    output << wire::dump(json.get()) << '\n';
-    output.close();
-    chmod(temporary.c_str(), 0600);
-    std::filesystem::rename(temporary, path, error);
+    storeSettings(json.get());
     reloadSettings();
   }
-  void applyAppearance() {
+  void applyAppearance(bool themeChanged, bool sizeChanged) {
+    if (!themeChanged && !sizeChanged)
+      return;
     const char *configHome = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
     std::filesystem::path path =
         configHome ? configHome
@@ -1645,40 +1919,39 @@ class WeType : public InputMethodEngineV2 {
     if (error)
       return;
     std::ifstream input(path);
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(input, line))
-      lines.push_back(line);
+    if ((std::filesystem::exists(path, error) && !input) || error)
+      return;
+    const std::string text((std::istreambuf_iterator<char>(input)), {});
+    if (input.bad())
+      return;
     const auto &appearance = *config_.appearance;
-    std::map<std::string, std::string> values = {
-        {"Theme", *appearance.theme == wetype_config::ThemeMode::Dark
-                      ? "wetypex-dark"
-                      : "wetypex-light"},
-        {"DarkTheme", "wetypex-dark"},
-        {"UseDarkTheme", *appearance.theme == wetype_config::ThemeMode::System
-                             ? "True"
-                             : "False"},
-        {"UseAccentColor", "False"},
-        {"PreferTextIcon", "False"},
-        {"Font",
-         "Noto Sans CJK SC " + std::to_string(*appearance.candidateSize)}};
-    for (auto &[key, value] : values) {
-      bool found = false;
-      for (auto &existing : lines)
-        if (existing.rfind(key + "=", 0) == 0) {
-          existing = key + "=" + value;
-          found = true;
-          break;
-        }
-      if (!found)
-        lines.push_back(key + "=" + value);
+    std::map<std::string, std::string> values;
+    if (themeChanged) {
+      values = {
+          {"Theme", *appearance.theme == wetype_config::ThemeMode::Dark
+                        ? "wetypex-dark"
+                        : "wetypex-light"},
+          {"DarkTheme", "wetypex-dark"},
+          {"UseDarkTheme", *appearance.theme == wetype_config::ThemeMode::System
+                               ? "True"
+                               : "False"},
+          {"UseAccentColor", "False"},
+          {"PreferTextIcon", "False"}};
     }
+    if (sizeChanged)
+      values["Font"] = wetype::candidateFontWithSize(
+          wetype::classicUiValue(text, "Font").value_or(""),
+          *appearance.candidateSize);
+    const auto updated = wetype::updateClassicUi(text, values);
+    if (updated == text)
+      return;
     auto temporary = path;
     temporary += ".tmp";
     std::ofstream output(temporary, std::ios::trunc);
-    for (auto &entry : lines)
-      output << entry << '\n';
+    output << updated;
     output.close();
+    if (!output)
+      return;
     chmod(temporary.c_str(), 0600);
     std::filesystem::rename(temporary, path, error);
     if (!error)
@@ -1756,6 +2029,9 @@ class WeType : public InputMethodEngineV2 {
     auto control = wire::parse(bytes);
     if (wire::number(control.get(), "version") != 1)
       return false;
+    if (std::string_view(operation) == "start" &&
+        (wire::number(control.get(), "voice_protocol") != 2 || wire::str(control.get(), "voice_revision") != WETYPE_VOICE_REVISION))
+      return false;
     const auto address = wire::str(control.get(), "address");
     const auto prefix = "wetypex-voice-" + std::to_string(getuid()) + "-";
     sockaddr_un socketAddress{};
@@ -1772,7 +2048,7 @@ class WeType : public InputMethodEngineV2 {
     if (::connect(fd, reinterpret_cast<sockaddr *>(&socketAddress),
                 offsetof(sockaddr_un, sun_path) + 1 + address.size()) ||
         getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peerSize) ||
-        peer.uid != getuid()) {
+        peer.uid != getuid() || peer.pid != wire::number(control.get(), "pid")) {
       close(fd);
       return false;
     }
@@ -1783,6 +2059,7 @@ class WeType : public InputMethodEngineV2 {
     wire::put(message.get(), "epoch", int64_t(voiceEpoch_));
     wire::put(message.get(), "pid", int64_t(getpid()));
     wire::put(message.get(), "traditional", traditional);
+    wire::put(message.get(), "provider", std::string(*config_.voice->provider == wetype_config::VoiceProviderMode::Local ? "local" : "original"));
     const auto payload = wire::dump(message.get()) + '\n';
     bool delivered = ::send(fd, payload.data(), payload.size(),
                            MSG_NOSIGNAL | MSG_DONTWAIT) == ssize_t(payload.size());
@@ -1798,10 +2075,14 @@ class WeType : public InputMethodEngineV2 {
       voiceDaemonPid_ = peer.pid;
     return delivered;
   }
+  bool voiceAvailable() const {
+    return networkEnabled_ || *config_.voice->provider == wetype_config::VoiceProviderMode::Local;
+  }
   void primeVoice() {
     voiceWarmTick_ = now(CLOCK_MONOTONIC);
-    if (networkEnabled_ &&
-        (*config_.voice->launchShortcut || *config_.voice->holdShortcut) &&
+    if (voiceAvailable() &&
+        ((*config_.voice->launchShortcut && !config_.voice->launchKey->empty()) ||
+         (*config_.voice->holdShortcut && !config_.voice->holdKey->empty())) &&
         !voiceControl("status"))
       startProcess({WETYPE_VOICE, "status"});
   }
@@ -1830,6 +2111,7 @@ class WeType : public InputMethodEngineV2 {
     if (voicePending_ || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
     auto *s = state(ic);
+    flushNumericPreview(ic, s);
     if (s->vMode || s->vMenu != VMenu::None)
       cancelVMode(ic, "voice input started");
     ++s->epoch;
@@ -1854,10 +2136,18 @@ class WeType : public InputMethodEngineV2 {
     voiceStatusUntil_ = 0;
     voiceDaemonPid_ = 0;
     lastVoiceVersion_ = 0;
-    if (!voiceControl("start", s->traditional))
-      startProcess({WETYPE_VOICE, "start", std::to_string(voiceSession_),
-                    std::to_string(voiceEpoch_), voiceToken_,
-                    s->traditional ? "1" : "0"});
+    if (!voiceControl("start", s->traditional)) {
+      if (access(WETYPE_VOICE, X_OK) != 0) {
+        cancelVoice(false);
+        voiceSession_ = s->id;
+        voiceError_ = "语音组件不可用，请重启输入法以加载当前安装版本";
+        voiceStatusUntil_ = now(CLOCK_MONOTONIC) + 6000000;
+      } else {
+        startProcess({WETYPE_VOICE, "start", std::to_string(voiceSession_),
+                      std::to_string(voiceEpoch_), voiceToken_,
+                      s->traditional ? "1" : "0"});
+      }
+    }
     panel(ic, s);
   }
   void stopVoice(bool immediate = false) {
@@ -1983,12 +2273,17 @@ class WeType : public InputMethodEngineV2 {
     ++s->vMenuGeneration;
     s->vMenuTitle = std::move(title);
     s->vMenuEntries = std::move(entries);
+    s->candidatePage = s->candidateCursor = 0;
+    updateVMenu(ic, s);
+    panel(ic, s);
+  }
+  void updateVMenu(InputContext *ic, State *s) {
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(pageSize_);
     list->setCursorPositionAfterPaging(CursorPositionAfterPaging::ResetToFirst);
     const bool nativeLabels = *config_.appearance->labelStyle ==
                               wetype_config::CandidateLabelStyle::Fcitx;
-    list->setSelectionKey(nativeLabels && kind != VMenu::Main
+    list->setSelectionKey(nativeLabels && s->vMenu != VMenu::Main
                               ? Key::keyListFromString("1 2 3 4 5 6 7 8 9")
                               : KeyList{});
     list->setLayoutHint(vertical_ ? CandidateLayoutHint::Vertical
@@ -2005,18 +2300,18 @@ class WeType : public InputMethodEngineV2 {
       std::replace(display.begin(), display.end(), '\r', ' ');
       if (end < text.size())
         display += "…";
-      if (!nativeLabels && kind != VMenu::Main)
+      if (!nativeLabels && s->vMenu != VMenu::Main)
         display = std::to_string(i % pageSize_ + 1) + display;
       list->append<VMenuWord>(this, std::move(display), i, s->vMenuGeneration,
                               s->epoch, s->id);
     }
-    s->candidatePage = s->candidateCursor = 0;
     if (list->totalSize()) {
-      list->setPage(0);
-      list->setGlobalCursorIndex(0);
+      s->candidateCursor = std::clamp(s->candidateCursor, 0, list->totalSize() - 1);
+      s->candidatePage = s->candidateCursor / pageSize_;
+      list->setPage(s->candidatePage);
+      list->setGlobalCursorIndex(s->candidateCursor);
     }
     ic->inputPanel().setCandidateList(std::move(list));
-    panel(ic, s);
   }
   void mainVMenu(InputContext *ic) {
     nativeVMenu(ic, VMenu::Main, "快捷工具（数字计算，空格选择）",
@@ -2238,7 +2533,6 @@ class WeType : public InputMethodEngineV2 {
     s->preedit.clear();
     s->cursor = 0;
     s->symbolAutoState = 0;
-    clearNumericCorrection(s);
     clearDisplayState(s);
     ic->inputPanel().setCandidateList(nullptr);
     for (size_t i = 1; i < prefix.size(); ++i) {
@@ -2372,6 +2666,31 @@ class WeType : public InputMethodEngineV2 {
            ic->capabilityFlags().test(CapabilityFlag::Preedit) &&
            ic->isPreeditEnabled();
   }
+  static bool nativeEnglishField(InputContext *ic) {
+    if (ic->capabilityFlags().test(CapabilityFlag::NoSpellCheck))
+      return true;
+    // Electron's X11 IM bridge does not propagate the editor's spellcheck=false
+    // hint. Keep native key events for VS Code so its own quote pairing and
+    // IntelliSense trigger characters can run.
+    auto program = ic->program();
+    const auto slash = program.find_last_of('/');
+    if (slash != std::string::npos)
+      program.erase(0, slash + 1);
+    std::transform(program.begin(), program.end(), program.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    constexpr std::string_view desktop = ".desktop";
+    if (program.size() > desktop.size() &&
+        program.compare(program.size() - desktop.size(), desktop.size(),
+                        desktop) == 0)
+      program.resize(program.size() - desktop.size());
+    return program == "code" || program == "code-insiders" ||
+           program == "code-oss" || program == "vscode" ||
+           program == "codium" || program == "codium-insiders" ||
+           program == "com.visualstudio.code" ||
+           program == "com.visualstudio.code.insiders" ||
+           program == "com.vscodium.codium" ||
+           program == "com.vscodium.codium-insiders";
+  }
   static bool englishCompletionField(InputContext *ic) {
     constexpr auto blocked =
         uint64_t(CapabilityFlag::Password) | uint64_t(CapabilityFlag::Sensitive) |
@@ -2379,7 +2698,8 @@ class WeType : public InputMethodEngineV2 {
         uint64_t(CapabilityFlag::Email) | uint64_t(CapabilityFlag::Digit) |
         uint64_t(CapabilityFlag::Number) | uint64_t(CapabilityFlag::Dialable) |
         uint64_t(CapabilityFlag::Terminal);
-    return !(ic->capabilityFlags().toInteger() & blocked);
+    return !(ic->capabilityFlags().toInteger() & blocked) &&
+           !nativeEnglishField(ic);
   }
   bool englishCompletionEnabled(InputContext *ic, const State *s) const {
     return *config_.input->englishCompletion && !s->fullWidth &&
@@ -2398,6 +2718,15 @@ class WeType : public InputMethodEngineV2 {
     if (!englishDictionary_)
       englishDictionary_.emplace();
     return *englishDictionary_;
+  }
+  void moveHorizontalCandidate(CommonCandidateList &list, bool next) const {
+    if (!list.totalSize())
+      return;
+    const int target = std::clamp(std::max(list.globalCursorIndex(), 0) +
+                                      (next ? 1 : -1),
+                                  0, list.totalSize() - 1);
+    list.setPage(target / pageSize_);
+    list.setGlobalCursorIndex(target);
   }
   void updateEnglishCandidates(InputContext *ic, State *s) {
     if (!englishCompletionEnabled(ic, s) || s->englishWord.size() < 2) {
@@ -2458,8 +2787,7 @@ class WeType : public InputMethodEngineV2 {
                         (sym >= FcitxKey_A && sym <= FcitxKey_Z);
     const bool apostrophe = sym == FcitxKey_apostrophe &&
                             !s->englishWord.empty() &&
-                            s->englishWord.back() != '\'' &&
-                            s->pendingPairKey != '\'';
+                            s->englishWord.back() != '\'';
     if (!commandModifiers && (letter || apostrophe)) {
       if (s->englishWord.empty() && !englishDictionary().available()) {
         auto *spell = spellAddon();
@@ -2493,10 +2821,8 @@ class WeType : public InputMethodEngineV2 {
       const bool pageDown = selectionKey.check(FcitxKey_Page_Down) ||
           selectionKey.checkKeyList(instance_->globalConfig().defaultNextPage());
       if (previous || next || pageUp || pageDown) {
-        if (previous)
-          list->prevCandidate();
-        else if (next)
-          list->nextCandidate();
+        if (previous || next)
+          moveHorizontalCandidate(*list, next);
         else if (pageUp && list->hasPrev())
           list->prev();
         else if (pageDown && list->hasNext())
@@ -2520,6 +2846,8 @@ class WeType : public InputMethodEngineV2 {
         return true;
       }
     }
+    if (s->englishWord.empty())
+      return false;
     if (!commandModifiers && sym >= 0x20 && sym <= 0x7e) {
       const char ascii = char(sym);
       const auto *entry = punctuationEntry(ascii);
@@ -2554,39 +2882,38 @@ class WeType : public InputMethodEngineV2 {
   void panel(InputContext *ic, State *s) {
     // The insertion must reach the client before its preedit is replaced.
     flushTextBatch(ic);
-    const bool inlinePreedit = inlinePreeditEnabled(ic);
+    const bool inlinePreedit = !s->numericPreview.empty() || inlinePreeditEnabled(ic);
     const bool englishPreedit = !s->englishWord.empty();
     if (englishPreedit)
       updateEnglishCandidates(ic, s);
     const bool voice = voicePending_ && voiceSession_ == s->id &&
                        voiceEpoch_ == s->epoch;
+    const bool doublePinyin =
+        *config_.input->mode == wetype_config::InputMode::DoublePinyin;
     const auto candidates = ic->inputPanel().candidateList();
-    if (s->preedit.empty() || inlinePreedit || voice || s->vMode ||
+    if (s->preedit.empty() || (inlinePreedit && !doublePinyin) || voice || s->vMode ||
         s->vMenu != VMenu::None) {
       s->initialPanelDeadline = 0;
       s->initialPanelShown = false;
-    } else if (!s->initialPanelShown &&
-               (!candidates || !candidates->size()) &&
-               s->inputSeq > s->applied && !failed_) {
+    } else if ((doublePinyin ||
+                (!s->initialPanelShown && (!candidates || !candidates->size()))) &&
+               s->inputSeq > s->applied && !failed_ &&
+               s->initialPanelInputSeq != s->inputSeq) {
       const auto time = now(CLOCK_MONOTONIC);
       if (!s->initialPanelDeadline) {
-        // Usually the real core replies within a millisecond. Let that
-        // reply populate the first popup instead of mapping a tiny window.
-        // One frame bounds feedback for a slow or still-starting core.
+        // Double-pinyin segmentation is supplied by the core. Preserve its
+        // previous frame until the reply, rather than flashing raw spelling
+        // between two segmented strings. Do not restart this deadline on
+        // each key: slow/startup paths still get feedback within one frame.
         s->initialPanelDeadline = time + 16000;
         if (timer_) {
           timer_->setAccuracy(1000);
           timer_->setTime(std::min(timer_->time(), s->initialPanelDeadline));
         }
       }
-      if (time < s->initialPanelDeadline) {
-        const bool visible = !ic->inputPanel().empty();
-        ic->inputPanel().reset();
-        ic->updatePreedit();
-        if (visible)
-          ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+      if (time < s->initialPanelDeadline)
         return;
-      }
+      s->initialPanelInputSeq = s->inputSeq;
       s->initialPanelShown = true;
       s->initialPanelDeadline = 0;
     } else {
@@ -2595,7 +2922,7 @@ class WeType : public InputMethodEngineV2 {
     }
     Text aux;
     if (voice)
-      aux = Text("语音输入 " + std::string(voiceLevel_ / 12, '|'));
+      aux = Text("🎙 语音输入 " + std::string(voiceLevel_ / 12, '|'));
     else if (s->vMenu != VMenu::None)
       aux = Text(s->vMenuTitle);
     else if (s->vCalculator)
@@ -2605,6 +2932,7 @@ class WeType : public InputMethodEngineV2 {
     ic->inputPanel().setAuxUp(aux);
     const std::string displayed =
         voice ? voiceText_
+        : !s->numericPreview.empty() ? s->numericPreview
         : englishPreedit ? s->englishWord
         : !s->displayPreedit.empty() ? s->displayPreedit
         : !s->vMode && *config_.input->mode == wetype_config::InputMode::Pinyin
@@ -2613,9 +2941,13 @@ class WeType : public InputMethodEngineV2 {
     // Text("") contains one empty segment and is not empty to Fcitx UI.
     Text text;
     if (!displayed.empty()) {
-      text.append(displayed);
+      // A partial transcript is a preview. Fcitx commits ordinary client
+      // preedit before focus-out reaches deactivate(), which would otherwise
+      // accept the partial even though the voice session is cancelled.
+      text.append(displayed, voice ? TextFormatFlag::DontCommit
+                                   : TextFormatFlag::NoFlag);
       text.setCursor(
-          voice || englishPreedit ? displayed.size()
+          voice || englishPreedit || !s->numericPreview.empty() ? displayed.size()
           : !s->displayPreedit.empty()
               ? std::min(s->displayCursor, displayed.size())
               : displayCursorForRaw(s->preedit, displayed, s->cursor));
@@ -2633,7 +2965,8 @@ class WeType : public InputMethodEngineV2 {
                         : "正在识别… Enter 立即上屏 · Esc 取消");
     else if (voiceSession_ == s->id && voiceStatusUntil_)
       status.append(voiceError_);
-    else if (!englishPreedit && !displayed.empty() && (failed_ || !ready_))
+    else if (!englishPreedit && s->numericPreview.empty() &&
+             !displayed.empty() && (failed_ || !ready_))
       status.append(failed_ ? "WeTypeX 核心正在恢复…" : "WeTypeX 核心启动中…");
     ic->inputPanel().setAuxDown(status);
     if (s->preedit.empty() && !englishPreedit && !s->vMode)
@@ -2677,12 +3010,13 @@ class WeType : public InputMethodEngineV2 {
       for (const auto &[id, ref] : contexts_)
         if (auto *ic = ref.get()) {
           const auto *s = ic->propertyFor(&factory_);
-          if (!s->preedit.empty() || !s->englishWord.empty() || s->vMode ||
+          if (!s->preedit.empty() || !s->englishWord.empty() ||
+              !s->numericPreview.empty() || s->vMode ||
               s->vMenu != VMenu::None ||
               s->seq != s->applied || s->selectionPending ||
               !s->deferredKeys.empty() || !s->cursorKeys.empty() ||
-              s->pendingCursorSteps || s->pendingClientKey || s->pendingNumericReplay ||
-              !s->forwardedKeys.empty() || !s->pendingNumericText.empty() ||
+              s->pendingCursorSteps || s->pendingClientKey ||
+              !s->forwardedKeys.empty() ||
               modifiersHeld(instance_, ic, s, true))
             return false;
         }
@@ -2755,6 +3089,8 @@ class WeType : public InputMethodEngineV2 {
         auto *s = ic->propertyFor(&factory_);
         ++s->epoch;
         s->seq = s->applied = s->inputSeq = s->appliedUpdate = 0;
+        s->initialPanelInputSeq = 0;
+        s->initialPanelDeadline = 0;
         s->cloudPollUntil = 0;
         if (s->active && ic->hasFocus()) {
           ic->inputPanel().reset();
@@ -2851,10 +3187,10 @@ class WeType : public InputMethodEngineV2 {
         s->heldModifierKeys.clear();
         ++s->epoch;
         s->seq = s->applied = s->inputSeq = 0;
+        s->initialPanelInputSeq = 0;
         s->appliedUpdate = 0;
         s->initialPanelDeadline = 0;
         s->initialPanelShown = false;
-        clearNumericCorrection(s);
         s->selectionPending = false;
         s->deferredKeys.clear();
         s->modifierCandidate = Key();
@@ -2867,7 +3203,6 @@ class WeType : public InputMethodEngineV2 {
         s->cloudPollUntil = 0;
         s->pendingPairKey = 0;
         s->pendingPairRight.clear();
-        s->outerPairs.clear();
         s->symbolAutoState = 0;
         if (s->active) {
           ic->inputPanel().reset();
@@ -2898,6 +3233,7 @@ class WeType : public InputMethodEngineV2 {
     const char *override = getenv("WETYPE_BACKEND_LAUNCHER");
     std::string launcher = override ? override : WETYPE_LAUNCHER;
     char *argv[] = {launcher.data(), nullptr};
+    const auto identity = identityStamp();
     int result = posix_spawn(&child_, launcher.c_str(), &actions, nullptr, argv,
                              environ);
     posix_spawn_file_actions_destroy(&actions);
@@ -2909,6 +3245,7 @@ class WeType : public InputMethodEngineV2 {
       child_ = -1;
       return false;
     }
+    backendIdentity_ = identity;
     write_ = to[1];
     read_ = from[0];
     fcntl(write_, F_SETFL, fcntl(write_, F_GETFL) | O_NONBLOCK);
@@ -3158,7 +3495,7 @@ class WeType : public InputMethodEngineV2 {
         cursorCommitPosition >= 0 &&
         size_t(cursorCommitPosition) <= utf8::length(cursorCommit);
     const bool mergeCursorCommit =
-        hasCursorCommit && std::string_view(ic->frontend()) == "ibus";
+        hasCursorCommit && virtualKeyboardCursor(ic);
     std::string cursorPrefix;
     const bool previousSpacingBypass = spacingBypass_;
     spacingBypass_ |= json_object_get_boolean(wire::get(j.get(), "preserve_spacing"));
@@ -3175,7 +3512,7 @@ class WeType : public InputMethodEngineV2 {
     if (!mergeCursorCommit)
       spacingBypass_ = previousSpacingBypass;
     if (hasCursorCommit) {
-      // GNOME's Wayland text-input client can replace pending text when
+      // Wayland clients can replace or recommit pending preedit when
       // multiple commits arrive before the next done event. Submit the
       // selected word and its bracket pair together, with the caret offset
       // adjusted for the prefix, so neither part can overwrite the other.
@@ -3213,6 +3550,16 @@ class WeType : public InputMethodEngineV2 {
         }
       }
     s->revision = wire::number(j.get(), "revision");
+    s->candidates.reset(json_object_get(wire::get(j.get(), "candidates")));
+    s->cloudFlags.reset(json_object_get(wire::get(j.get(), "cloud")));
+    updateCandidates(ic, s);
+    panel(ic, s);
+    auto deferred = std::move(s->deferredKeys);
+    s->deferredKeys.clear();
+    replayDeferredKeys(ic, std::move(deferred));
+  }
+
+  void updateCandidates(InputContext *ic, State *s) {
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(pageSize_);
     list->setCursorPositionAfterPaging(CursorPositionAfterPaging::ResetToFirst);
@@ -3222,8 +3569,9 @@ class WeType : public InputMethodEngineV2 {
         nativeLabels ? Key::keyListFromString("1 2 3 4 5 6 7 8 9") : KeyList{});
     list->setLayoutHint(vertical_ ? CandidateLayoutHint::Vertical
                                   : CandidateLayoutHint::Horizontal);
-    auto *candidates = wire::get(j.get(), "candidates");
-    auto *cloudFlags = wire::get(j.get(), "cloud");
+    auto *candidates = s->candidates.get();
+    auto *cloudFlags = s->cloudFlags.get();
+    const bool wechat = wetype::WeChatEmoticons::isWeChat(ic->program());
     if ((!s->preedit.empty() || s->vMode) && candidates &&
         json_object_is_type(candidates, json_type_array))
       for (size_t i = 0;
@@ -3246,10 +3594,7 @@ class WeType : public InputMethodEngineV2 {
             display += "☁";
           auto text = std::string_view(json_object_get_string(v),
                                        json_object_get_string_len(v));
-          const auto *emoticon =
-              wetype::WeChatEmoticons::isWeChat(ic->program())
-                  ? wechatEmoticons_.find(text)
-                  : nullptr;
+          const auto *emoticon = wechat ? wechatEmoticons_.find(text) : nullptr;
           if (emoticon && wechatFont_)
             display += utf8::UCS4ToUTF8(emoticon->codepoint) + " ";
           display += text;
@@ -3268,10 +3613,6 @@ class WeType : public InputMethodEngineV2 {
       ic->inputPanel().setCandidateList(std::move(list));
     } else
       ic->inputPanel().setCandidateList(nullptr);
-    panel(ic, s);
-    auto deferred = std::move(s->deferredKeys);
-    s->deferredKeys.clear();
-    replayDeferredKeys(ic, std::move(deferred));
   }
 
 public:
@@ -3367,37 +3708,17 @@ public:
             key.filterAndAccept();
           }
         });
-    numericWatcher_ = instance_->watchEvent(
+    surroundingWatcher_ = instance_->watchEvent(
         EventType::InputContextSurroundingTextUpdated, EventWatcherPhase::Default,
         [this](Event &event) {
           auto *ic = static_cast<InputContextEvent &>(event).inputContext();
           const auto *entry = instance_->inputMethodEntry(ic);
+          if (entry && entry->uniqueName() == "wetypex")
+            acknowledgeCursorView(ic, state(ic));
           if (entry && entry->uniqueName() == "wetypex" &&
-              !state(ic)->pendingNumericText.empty())
-            scheduleNumericCorrection();
-          if (entry && entry->uniqueName() == "wetypex" &&
-              state(ic)->pendingClientKey)
+              (state(ic)->pendingClientKey || state(ic)->pendingCursorSteps))
             scheduleCursorMove();
         });
-    // Old Fcitx emits deletes immediately but queues key-event commits.
-    // Correct text outside that key transaction and retry while the client
-    // acknowledges its recently inserted numeric text.
-    numericTimer_ = instance_->eventLoop().addTimeEvent(
-        CLOCK_MONOTONIC, now(CLOCK_MONOTONIC), 1000,
-        [this](auto *source, uint64_t) {
-          bool retry = false;
-          for (auto &[id, ref] : contexts_)
-            if (auto *ic = ref.get()) {
-              auto *s = ic->propertyFor(&factory_);
-              resolveNumericCorrection(ic, s);
-              retry |= !s->pendingNumericText.empty();
-            }
-          if (retry)
-            source->setTime(now(CLOCK_MONOTONIC) + 2000);
-          source->setEnabled(retry);
-          return true;
-        });
-    numericTimer_->setEnabled(false);
     cursorTimer_ = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC, now(CLOCK_MONOTONIC), 1000,
         [this](auto *source, uint64_t time) {
@@ -3459,7 +3780,7 @@ public:
             syncTick_ = time;
             receiveVoice();
           }
-          if (focused && networkEnabled_ && !runtimePending_ && time >= voiceWarmTick_ + 60000000)
+          if (focused && voiceAvailable() && !runtimePending_ && time >= voiceWarmTick_ + 60000000)
             primeVoice();
           pollVModeWindow();
           if (*config_.update->autoUpdate &&
@@ -3497,9 +3818,22 @@ public:
     return &config_;
   }
   void setConfig(const RawConfig &raw) override {
+    finishNumericPreviews();
+    const auto before = config_;
+    const auto oldTheme = *config_.appearance->theme;
+    const auto oldSize = *config_.appearance->candidateSize;
     config_.load(raw, true);
+    const bool themeChanged = *config_.appearance->theme != oldTheme;
+    const bool sizeChanged = *config_.appearance->candidateSize != oldSize;
     saveNativeConfig();
-    applyAppearance();
+    applyAppearance(themeChanged, sizeChanged);
+    if (*before.voice->provider != *config_.voice->provider ||
+        *before.voice->localModel != *config_.voice->localModel)
+      cancelVoice();
+    if (frontendOnly(before)) {
+      refreshPresentation();
+      return;
+    }
     if (runtimePhase_ != RuntimePhase::Idle) {
       runtimeConfigApply_ = true;
       return;
@@ -3522,9 +3856,19 @@ public:
     setConfig(raw);
   }
   void reloadConfig() override {
+    const auto before = config_;
+    auto oldEngineSettings = std::move(engineSettings_);
+    reloadSettings();
+    if (*before.voice->provider != *config_.voice->provider ||
+        *before.voice->localModel != *config_.voice->localModel)
+      cancelVoice();
+    if (frontendOnly(before) && oldEngineSettings && engineSettings_ &&
+        json_object_equal(oldEngineSettings.get(), engineSettings_.get())) {
+      refreshPresentation();
+      return;
+    }
     cancelVoice();
     englishDictionary_.reset();
-    reloadSettings();
     if (networkEnabled_)
       startSync();
     else
@@ -3545,8 +3889,7 @@ public:
         releaseForwardedKeys(ic, ic->propertyFor(&factory_));
     cancelVoice();
     languageModifierWatcher_.reset();
-    numericWatcher_.reset();
-    numericTimer_.reset();
+    surroundingWatcher_.reset();
     cursorTimer_.reset();
     timer_.reset();
     stop();
@@ -3594,10 +3937,37 @@ public:
   void reset(const InputMethodEntry &, InputContextEvent &e) override {
     auto *ic = e.inputContext();
     auto *s = state(ic);
-    releaseForwardedKeys(ic, s);
-    clearCursorMove(s);
-    s->physicalModifiers = s->pressedShifts = 0;
-    s->heldModifierKeys.clear();
+    const auto time = now(CLOCK_MONOTONIC);
+    const bool editing = s->active && ic->hasFocus() &&
+        !ic->capabilityFlags().test(CapabilityFlag::Password) &&
+        !ic->capabilityFlags().test(CapabilityFlag::Sensitive) &&
+        s->preedit.empty() && s->englishWord.empty() && !s->selectionPending;
+    // After the client acknowledges our edit, a later reset is a new
+    // cancellation (for example a mouse selection), not its commit echo.
+    const bool cursorPending = editing && s->pendingCursorSteps &&
+        !s->cursorViewAcknowledged &&
+        (!s->cursorDeadline || time <= s->cursorDeadline);
+    const bool clientPending = editing && s->pendingClientKey && s->clientHadText &&
+        ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+        time < s->cursorReplayAt &&
+        (!s->clientExpected.empty() || s->symbolAutoState);
+    const auto numericState = editing ? s->symbolAutoState : 0;
+    if (!cursorPending)
+      releaseForwardedKeys(ic, s);
+    if (!clientPending && !cursorPending)
+      clearCursorMove(s);
+    else if (clientPending) {
+      s->clientResetPending = true;
+      s->clientRequireChange = true;
+    }
+    if (cursorPending) {
+      s->cursorResetPending = true;
+      if (s->cursorReplayAt)
+        s->cursorMoveReset = true;
+    } else {
+      s->physicalModifiers = s->pressedShifts = 0;
+      s->heldModifierKeys.clear();
+    }
     if (voicePending_ && voiceSession_ == s->id)
       cancelVoice();
     if (vModeSession_ == s->id)
@@ -3611,16 +3981,18 @@ public:
     ++s->epoch;
     s->initialPanelDeadline = 0;
     s->initialPanelShown = false;
-    clearNumericCorrection(s);
+    s->numericPreview.clear();
     s->preedit.clear();
     s->englishWord.clear();
     s->englishCandidateCursor = 0;
     s->cursor = 0;
     clearDisplayState(s);
-    s->pendingPairKey = 0;
-    s->pendingPairRight.clear();
-    s->outerPairs.clear();
-    s->symbolAutoState = 0;
+    if (!cursorPending) {
+      s->pendingPairKey = 0;
+      s->pendingPairRight.clear();
+    }
+    s->symbolAutoState = numericState;
+    s->validateNumericState = numericState != 0;
     s->vMode = false;
     s->vCalculator = false;
     s->cloudPollUntil = 0;
@@ -3638,6 +4010,8 @@ public:
     auto *ic = e.inputContext();
     auto *s = state(ic);
     // Fcitx or the client commits inline preedit when focus leaves.
+    if (e.type() != EventType::InputContextFocusOut)
+      flushNumericPreview(ic, s);
     if (englishCompletionField(ic) &&
         (e.type() != EventType::InputContextFocusOut || !inlinePreeditEnabled(ic)))
       commitEnglishWord(ic, s);
@@ -3758,7 +4132,7 @@ public:
     return std::string(s->english ? "英文" : "中文") +
            (s->traditional ? " · 繁体" : " · 简体") +
            (s->fullWidth ? " · 全角" : " · 半角") +
-           (s->english || englishPunctuation(s)
+           (s->english || (!s->fullWidth && englishPunctuation(s))
                 ? " · 英文标点" : " · 中文标点");
   }
   void modeChanged(InputContext *ic, State *s, bool notify = true) {
@@ -3768,6 +4142,7 @@ public:
       showModeInfo(instance_, ic, modeDescription(s));
   }
   void switchLanguage(InputContext *ic, State *s) {
+    flushNumericPreview(ic, s);
     if (s->vMode)
       cancelVMode(ic);
     commitEnglishWord(ic, s);
@@ -3794,7 +4169,6 @@ public:
     }
     s->english = !s->english;
     s->symbolAutoState = 0;
-    clearNumericCorrection(s);
     s->modifierCandidate = Key();
     ic->inputPanel().reset();
     panel(ic, s);
@@ -3893,8 +4267,16 @@ public:
         s->physicalModifiers &= ~Key::keySymToStates(sym).toInteger();
       if (s->pressedShifts)
         s->physicalModifiers |= uint32_t(KeyState::Shift);
-      if (e.isRelease())
+      if (e.isRelease() && !waylandV2(ic))
         releaseForwardedKey(ic, s, e.rawKey());
+    }
+    // A passed press belongs to the client even if an IM transaction has
+    // started since. Release it immediately instead of buffering/dropping
+    // its up event and leaving the client's repeat timer running.
+    if (!replayingKeys_ && waylandV2(ic) && e.isRelease() &&
+        releaseForwardedKey(ic, s, e.rawKey())) {
+      e.filterAndAccept();
+      return;
     }
     if (!replayingKeys_) {
       if (key.isModifier()) {
@@ -3920,9 +4302,9 @@ public:
             (*config_.shortcuts->vMode && !s->english &&
              *config_.input->mode == wetype_config::InputMode::Pinyin &&
              key.checkKeyList(*config_.shortcuts->vModeKeys)) ||
-            (networkEnabled_ &&
-             ((*config_.shortcuts->aiAssistant && key.checkKeyList(*config_.shortcuts->aiAssistantKeys)) ||
-              (*config_.voice->launchShortcut && key.checkKeyList(*config_.voice->launchKey)) ||
+            (networkEnabled_ && *config_.shortcuts->aiAssistant && key.checkKeyList(*config_.shortcuts->aiAssistantKeys)) ||
+            (voiceAvailable() &&
+             ((*config_.voice->launchShortcut && key.checkKeyList(*config_.voice->launchKey)) ||
               (*config_.voice->holdShortcut && key.checkKeyList(*config_.voice->holdKey))));
         // Application commands run against the text already committed. Keep
         // their position in the IME event stream too, so a Ctrl+S between a
@@ -3940,19 +4322,37 @@ public:
         return;
       }
     }
-    const auto *numericBoundarySymbol =
-        sym >= 0x20 && sym <= 0x7e ? punctuationEntry(char(sym)) : nullptr;
-    const bool numericEdit =
-        !e.isRelease() &&
-        (sym == FcitxKey_BackSpace || sym == FcitxKey_Delete ||
-         sym == FcitxKey_Left || sym == FcitxKey_Right ||
-         sym == FcitxKey_Home || sym == FcitxKey_End ||
-         sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R ||
-         sym == FcitxKey_Return || sym == FcitxKey_KP_Enter ||
-         sym == FcitxKey_Tab ||
-         (numericBoundarySymbol && numericBoundarySymbol->pairType) ||
-         (sym >= FcitxKey_a && sym <= FcitxKey_z) ||
-         (sym >= FcitxKey_A && sym <= FcitxKey_Z));
+    if (!s->numericPreview.empty() &&
+        (!symbolAutoChange_ || s->english || englishPunctuation(s) || s->fullWidth))
+      flushNumericPreview(ic, s);
+    if (!s->numericPreview.empty() && !e.isRelease() && !key.isModifier()) {
+      s->modifierCandidate = Key();
+      const auto commands = key.states().toInteger() &
+          uint32_t(KeyState::SimpleMask) & ~uint32_t(KeyState::Shift);
+      if (!commands && sym >= FcitxKey_0 && sym <= FcitxKey_9) {
+        const auto value = s->numericPreview == "。" ? "." :
+                           s->numericPreview == "，" ? "," : ":";
+        const auto text = std::string(value) + char(sym);
+        flushNumericPreview(ic, s, false);
+        commitText(ic, text);
+        s->symbolAutoState = 3;
+        e.filterAndAccept();
+        return;
+      }
+      if (!commands && sym == FcitxKey_BackSpace) {
+        flushNumericPreview(ic, s, false);
+        e.filterAndAccept();
+        return;
+      }
+      if (!commands && sym == FcitxKey_space) {
+        const auto value = s->numericPreview + " ";
+        flushNumericPreview(ic, s, false);
+        commitText(ic, value);
+        e.filterAndAccept();
+        return;
+      }
+      flushNumericPreview(ic, s);
+    }
     const auto scalar = Key::keySymToUnicode(sym);
     const auto commandState = key.states().toInteger() &
                               uint32_t(KeyState::SimpleMask) &
@@ -3979,15 +4379,10 @@ public:
                        return !key.release && c >= 0x20 && c != 0x7f &&
                               !key.key.isModifier();
                      });
-    if ((!nativeClientKey && s->pendingClientKey) || s->pendingNumericReplay ||
-        (!s->pendingNumericText.empty() && numericEdit)) {
+    if (!nativeClientKey && s->pendingClientKey) {
       if (!e.isRelease())
         s->modifierCandidate = Key();
       s->cursorKeys.push_back({e.rawKey(), e.isRelease(), e.time(), replayingForwarded_});
-      if (!s->pendingClientKey) {
-        s->pendingNumericReplay = true;
-        scheduleNumericCorrection();
-      }
       e.filterAndAccept();
       return;
     }
@@ -4009,7 +4404,8 @@ public:
             (enter &&
              (queuedText || !e.rawKey().states().test(KeyState::Shift))) ||
             (queuedText &&
-             (sym == FcitxKey_BackSpace || sym == FcitxKey_Delete));
+             (sym == FcitxKey_BackSpace || sym == FcitxKey_Delete ||
+              sym == FcitxKey_Escape));
         if (!commands && ((scalar >= 0x20 && scalar != 0x7f) || orderedEdit)) {
           // This is a chord even if its printable key is replayed later.
           // Otherwise releasing Shift can switch language before a queued
@@ -4027,19 +4423,7 @@ public:
         replayDeferredKeys(ic, std::move(keys), true);
       }
     }
-    if (!e.isRelease() && !s->pendingNumericText.empty()) {
-      const auto commands = key.states().toInteger() &
-                            uint32_t(KeyState::SimpleMask) &
-                            ~uint32_t(KeyState::Shift);
-      const bool numeric = sym >= FcitxKey_0 && sym <= FcitxKey_9;
-      const auto *symbol = sym >= 0x20 && sym <= 0x7e
-                               ? punctuationEntry(char(sym)) : nullptr;
-      const bool continuation = (symbol && !symbol->pairType) || sym == FcitxKey_space ||
-                                sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
-      if (commands || (!numeric && !continuation))
-        clearNumericCorrection(s);
-    }
-    if (networkEnabled_ && e.rawKey().states().test(KeyState::Repeat) &&
+    if (voiceAvailable() && e.rawKey().states().test(KeyState::Repeat) &&
         ((*config_.voice->launchShortcut &&
           key.checkKeyList(*config_.voice->launchKey)) ||
          (*config_.voice->holdShortcut &&
@@ -4057,7 +4441,6 @@ public:
     if (replayingForwarded_) {
       s->modifierCandidate = Key();
       s->symbolAutoState = 0;
-      clearNumericCorrection(s);
       clearSpacing(s);
       return;
     }
@@ -4114,7 +4497,14 @@ public:
         s->modifierCandidate = Key();
       return;
     }
-    if (networkEnabled_ && *config_.voice->launchShortcut &&
+    if (!voiceAvailable() &&
+        ((*config_.voice->launchShortcut && key.checkKeyList(*config_.voice->launchKey)) ||
+         (*config_.voice->holdShortcut && key.checkKeyList(*config_.voice->holdKey)))) {
+      showModeInfo(instance_, ic, "单机模式已开启；请在语音设置中选择本地离线识别，或关闭单机模式");
+      e.filterAndAccept();
+      return;
+    }
+    if (voiceAvailable() && *config_.voice->launchShortcut &&
         key.checkKeyList(*config_.voice->launchKey)) {
       s->modifierCandidate = Key();
       if (voiceRecording_ && voiceHold_)
@@ -4126,7 +4516,7 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (networkEnabled_ && *config_.voice->holdShortcut &&
+    if (voiceAvailable() && *config_.voice->holdShortcut &&
         key.checkKeyList(*config_.voice->holdKey)) {
       s->modifierCandidate = Key();
       if (!voicePending_ && !flushBeforeVoice(ic, e))
@@ -4179,8 +4569,11 @@ public:
       }
       s->englishPunctuation = !englishPunctuation(s);
       s->symbolAutoState = 0;
-      clearNumericCorrection(s);
-      modeChanged(ic, s);
+      const bool saved = !*config_.input->rememberPunctuation ||
+                         rememberPunctuation(!*s->englishPunctuation);
+      modeChanged(ic, s, saved);
+      if (!saved)
+        showModeInfo(instance_, ic, modeDescription(s) + "（未能保存标点偏好）");
       e.filterAndAccept();
       return;
     }
@@ -4268,11 +4661,12 @@ public:
       }
     }
     if (s->english) {
+      if (!s->fullWidth && nativeEnglishField(ic))
+        return;
       if (sym >= 0x20 && sym <= 0x7e) {
         const char ascii = char(sym);
         const auto *entry = punctuationEntry(ascii);
-        if (entry &&
-            (s->fullWidth || entry->pairType || s->pendingPairKey == ascii)) {
+        if (entry && s->fullWidth) {
           commitSymbol(ic, s, ascii, true);
           e.filterAndAccept();
         } else if (s->fullWidth) {
@@ -4491,11 +4885,16 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (composing && horizontalNavigation && list && list->size()) {
-      if (sym == FcitxKey_Left)
-        list->prevCandidate();
-      else
-        list->nextCandidate();
+    // Match the original controller: at the first candidate Left edits the
+    // spelling; Right edits until the caret reaches its end, then selects.
+    // Wubi navigates candidates directly because it has no pinyin caret.
+    const bool candidateNavigation = composing && horizontalNavigation &&
+        list && list->size() &&
+        (*config_.input->mode == wetype_config::InputMode::Wubi ||
+         (sym == FcitxKey_Left && list->globalCursorIndex() > 0) ||
+         (sym == FcitxKey_Right && s->cursor >= s->preedit.size()));
+    if (candidateNavigation) {
+      moveHorizontalCandidate(*list, sym == FcitxKey_Right);
       s->candidatePage = list->currentPage();
       s->candidateCursor = list->globalCursorIndex();
       ic->updateUserInterface(UserInterfaceComponent::InputPanel);
@@ -4526,7 +4925,11 @@ public:
         }
         target = previous;
       } else if (sym == FcitxKey_Right && target < s->preedit.size()) {
-        target += firstUtf8Size(std::string_view(s->preedit).substr(target));
+        const auto next = std::upper_bound(s->cursorStops.begin(),
+                                           s->cursorStops.end(), target);
+        target = next != s->cursorStops.end()
+                     ? *next
+                     : target + firstUtf8Size(std::string_view(s->preedit).substr(target));
       }
       target = std::min(target, s->preedit.size());
       if (target != s->cursor) {
@@ -4661,7 +5064,6 @@ public:
       if (composing)
         send(ic, "punctuation", std::string(1, asciiChar), 0, -1, -1, literal);
       else {
-        appendNumericCorrection(s, literal);
         deliverNumericText(ic, s, literal);
       }
       e.filterAndAccept();
@@ -4671,68 +5073,26 @@ public:
     // SymbolAutoChangedHelper in the desktop implementation delays numeric
     // punctuation correction. Numeric punctuation is displayed in
     // Chinese form first; only another digit changes it back to ASCII.
+    if (!composing && s->validateNumericState) {
+      s->validateNumericState = false;
+      const auto context = symbolContext(ic);
+      if (!context.valid || !context.selected.empty() ||
+          context.before.empty() || context.before.back() < '0' ||
+          context.before.back() > '9')
+        s->symbolAutoState = 0;
+    }
     const bool autoChangeActive = symbolAutoChange_ && !composing &&
                                   !englishPunctuation(s) &&
                                   !s->fullWidth;
-    if (autoChangeActive && sym == FcitxKey_space &&
-        (s->symbolAutoState || !s->pendingNumericText.empty())) {
-      appendNumericCorrection(s, " ");
+    if (autoChangeActive && sym == FcitxKey_space && s->symbolAutoState) {
       s->symbolAutoState = 0;
       deliverNumericText(ic, s, " ");
       e.filterAndAccept();
       return;
     }
     if (!composing && digit && autoChangeActive) {
-      const char replacement = numericReplacement(s->symbolAutoState);
-      bool correctedBatch = false;
-      if (replacement && textBatch_ && textBatch_->context.get() == ic) {
-        auto &text = textBatch_->text;
-        const std::string previous = numericPunctuation(replacement);
-        if (text.size() > previous.size() &&
-            text.compare(text.size() - previous.size(), previous.size(),
-                         previous) == 0 &&
-            text[text.size() - previous.size() - 1] >= '0' &&
-            text[text.size() - previous.size() - 1] <= '9') {
-          text.replace(text.size() - previous.size(), previous.size(), 1,
-                       replacement);
-          clearNumericCorrection(s);
-          correctedBatch = true;
-        }
-      }
-      if (!correctedBatch && !s->pendingNumericText.empty()) {
-        if (replacement) {
-          const std::string previous = numericPunctuation(replacement);
-          auto &text = s->pendingNumericReplacement;
-          if (text.size() >= previous.size() &&
-              text.compare(text.size() - previous.size(), previous.size(),
-                           previous) == 0)
-            text.replace(text.size() - previous.size(), previous.size(), 1,
-                         replacement);
-        }
-        appendNumericCorrection(s, std::string(1, asciiChar));
-      } else if (!correctedBatch && replacement) {
-        const char *previous = numericPunctuation(replacement);
-        // Wayland clients may acknowledge committed punctuation after the
-        // next digit. Observe that exact suffix without delaying any keys.
-        if ((ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
-             numericKeyTransport(ic)) &&
-            !ic->capabilityFlags().test(CapabilityFlag::Sensitive) &&
-            // Qt temporarily invalidates its cache while forwarded keys are
-            // pending. The timer still requires the exact unselected suffix.
-            (!ic->surroundingText().isValid() ||
-             ic->surroundingText().cursor() ==
-                 ic->surroundingText().anchor())) {
-          s->pendingNumericText = std::string(previous) + asciiChar;
-          s->pendingNumericReplacement = std::string(1, replacement) + asciiChar;
-          s->pendingNumericUntil = now(CLOCK_MONOTONIC) + 250000;
-        }
-      }
       s->symbolAutoState = 3;
-      // Keep numeric separators on the client's ordered text path.
-      // Raw key forwarding can otherwise overtake a Wayland commit.
       deliverNumericText(ic, s, std::string(1, asciiChar));
-      if (!s->pendingNumericText.empty())
-        scheduleNumericCorrection();
       e.filterAndAccept();
       return;
     } else if (!composing && (!entry || !autoChangeActive)) {
@@ -4751,24 +5111,37 @@ public:
       e.filterAndAccept();
       return;
     }
+    if (!composing && digit && numericKeyTransport(ic)) {
+      // Use the same native event queue as Chinese punctuation even with
+      // auto-conversion disabled; an unhandled digit can overtake its commit.
+      deliverNumericText(ic, s, std::string(1, asciiChar));
+      e.filterAndAccept();
+      return;
+    }
     if (!composing && entry) {
       if (commitSymbol(ic, s, asciiChar, false))
         e.filterAndAccept();
       return;
     }
     if (composing && entry && !separator) {
+      finishPair(s);
       std::string mapped = mappedSymbol(s, asciiChar, false);
       int pairCursor = -1;
       auto [left, right] = splitPair(mapped);
       if (entry->pairType && !right.empty()) {
-        if (*config_.input->symbolAutoPair) {
-          pairCursor = 1;
-          rememberPair(ic, s, asciiChar, right);
+        auto context = symbolContext(ic);
+        // The selected candidate replaces the application's selection first.
+        // Do not wrap that old selection again after committing the word.
+        context.selected = {};
+        if (*config_.input->symbolAutoPair && symbolPairPosition(context)) {
+          pairCursor = utf8::length(mapped) - 1;
+          rememberPair(s, asciiChar, right);
         } else if (entry->pairType == 2) {
           bool &leftNext =
               asciiChar == '"' ? s->doubleQuoteLeft : s->singleQuoteLeft;
-          mapped = leftNext ? left : right;
-          leftNext = !leftNext;
+          const bool opening = quoteOpens(context, left, right, leftNext);
+          mapped = opening ? left : right;
+          leftNext = !opening;
         } else {
           mapped = left;
         }

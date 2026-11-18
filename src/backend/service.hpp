@@ -2,6 +2,7 @@
 // thread.
 #include "../common/wechat_emoticons.hpp"
 #include "control.hpp"
+#include <cstddef>
 #include <thread>
 static const wetype::WeChatEmoticons &service_emoticons() {
   static const wetype::WeChatEmoticons data(
@@ -11,19 +12,30 @@ static const wetype::WeChatEmoticons &service_emoticons() {
       "wechat-emoticons.json");
   return data;
 }
+// macOS 2.2.3.657 / Windows 2.1.3.18: the 40-byte aggregate is passed by
+// value, and is embedded at session config +0xf8 by mac-capi-v1.
+struct GroupSyncInfo {
+  bool unknown, debug;
+  unsigned char padding[6];
+  uint64_t groupId, functions, phraseVersion, dictionaryVersion;
+};
+static_assert(sizeof(GroupSyncInfo) == 40);
+static GroupSyncInfo current_group_sync{true, false, {}, 0, 0, 0, 0};
+static_assert(offsetof(GroupSyncInfo, groupId) == 8);
+static_assert(offsetof(GroupSyncInfo, dictionaryVersion) == 32);
+static uint64_t create_service_session(unsigned char (&config)[2048]) {
+  // A session also updates the core's global sync state. Reuse the latest
+  // notification, including a known group with every switch turned off.
+  memcpy(config + 0xf8, &current_group_sync, sizeof(current_group_sync));
+  return ((uint64_t (*)(void *))syms.at("_wxime_create_session"))(config);
+}
 static void configure_group_sync(uint64_t groupId, uint64_t functions,
                                  uint64_t phraseVersion,
                                  uint64_t dictionaryVersion) {
-  // macOS 2.2.3.657 / Windows 2.1.3.18: the 40-byte aggregate is passed by
-  // value.
-  struct GroupSyncInfo {
-    bool unknown, debug;
-    unsigned char padding[6];
-    uint64_t groupId, functions, phraseVersion, dictionaryVersion;
-  } info{
+  current_group_sync = {
       false, false, {}, groupId, functions, phraseVersion, dictionaryVersion};
-  static_assert(sizeof(GroupSyncInfo) == 40);
-  ((void (*)(GroupSyncInfo))syms.at("_wxime_group_sync_info_changed"))(info);
+  ((void (*)(GroupSyncInfo))syms.at("_wxime_group_sync_info_changed"))(
+      current_group_sync);
 }
 // Verified against +[WXIMEUtil addHotWord:value:] and removeHotWord:.
 // The 80-byte aggregate is passed BY VALUE, including in the enumerator
@@ -137,11 +149,14 @@ static void configure_cloud_session(unsigned char *config) {
 static void read_service_candidates(void *iterator,
                                     std::vector<ServiceCandidate> &output,
                                     bool wechat, bool calendarFirst) {
+  // A service process keeps one original runtime for its entire lifetime.
+  // Resolve this hot C API once rather than looking up its symbol per rank.
+  static const auto next =
+      reinterpret_cast<bool (*)(void *, void *)>(syms.at("_wxime_candidate_next"));
   output.clear();
   for (unsigned rank = 0; iterator && rank < 50 && output.size() < 50; rank++) {
     alignas(16) unsigned char c[512]{};
-    if (!((bool (*)(void *, void *))syms.at("_wxime_candidate_next"))(iterator,
-                                                                      c))
+    if (!next(iterator, c))
       break;
     const char *text;
     const unsigned char *id;
@@ -157,7 +172,9 @@ static void read_service_candidates(void *iterator,
     if (service_emoticons().hidden(candidate.text, wechat))
       continue;
     candidate.engineText = candidate.text;
-    candidate.text = service_emoticons().commit(candidate.text, wechat);
+    if (wechat)
+      if (const auto *entry = service_emoticons().find(candidate.text))
+        candidate.text = entry->commit;
     memcpy(&candidate.cover, c + 0x64, 4);
     // Cloud candidates carry a fixed marker pair in the engine's candidate
     // struct; local candidates leave both fields zero.
@@ -458,6 +475,25 @@ static void service_snapshot(ServiceSession &s, json_object *response) {
   s.commits.clear();
 }
 static void service_loop() {
+  // Prime the original engine and QEMU's translation cache while the backend
+  // starts. The warm-up session does not enable cloud candidates; real
+  // sessions keep their original input, settings and candidate order.
+  const auto warmup = syms.find("_wxime_warm_up_session");
+  if (getenv("WETYPE_QEMU_WRAPPED") && warmup != syms.end()) {
+    ServiceSession warm;
+    alignas(16) unsigned char config[2048]{};
+    config[1] = 1;
+    for (unsigned offset : {0x8u, 0x9u, 0xau, 0xbu, 0xcu})
+      config[offset] = 1;
+    warm.engine = create_service_session(config);
+    if (warm.engine) {
+      ((void (*)(uint64_t, decltype(&service_listener), void *))syms.at(
+          "_wxime_add_session_listener"))(warm.engine, service_listener, &warm);
+      ((int (*)(uint64_t))warmup->second)(warm.engine);
+      ((void (*)(uint64_t))syms.at("_wxime_reset_session"))(warm.engine);
+      ((void (*)(uint64_t))syms.at("_wxime_destroy_session"))(warm.engine);
+    }
+  }
   ServiceTransport transport;
   std::map<uint64_t, std::unique_ptr<ServiceSession>> sessions;
   printf("{\"event\":\"ready\",\"protocol\":1,\"backend\":\"original-wetype-"
@@ -513,14 +549,19 @@ static void service_loop() {
     } else if (op == "group_sync") {
       const auto group = wire::number(request.get(), "group_id");
       const auto functions = wire::number(request.get(), "func_switch");
-      if (!getenv("WETYPE_NETWORK_LIVE") || group <= 0 || functions < 0) {
+      const auto hotwordVersion = wire::number(request.get(), "hotword_version");
+      if (!getenv("WETYPE_NETWORK_LIVE") || group < 0 || functions < 0 ||
+          hotwordVersion < 0 || (!group && (functions || hotwordVersion))) {
         wire::put(response.get(), "error",
                   std::string("network disabled or invalid device group"));
       } else {
-        configure_group_sync(group, functions, 0, 0);
+        configure_group_sync(group, functions, hotwordVersion, 0);
         // The native core schedules synchronization asynchronously. This
         // acknowledges the request, not a completed dictionary download.
         wire::boolean(response.get(), "requested", true);
+        wire::put(response.get(), "group_id", group);
+        wire::put(response.get(), "func_switch", functions);
+        wire::put(response.get(), "hotword_version", hotwordVersion);
       }
     } else if (op == "hotword_list" || op == "hotword_set") {
       // Local words load asynchronously. An early empty list must never be
@@ -669,8 +710,7 @@ static void service_loop() {
         *(uint32_t *)(config + 0xb8) =
             wire::number(request.get(), "traditional", 0) ? 1 : 0;
         state->keyboard = keyboard;
-        state->engine =
-            ((uint64_t (*)(void *))syms.at("_wxime_create_session"))(config);
+        state->engine = create_service_session(config);
         if (!state->engine)
           _exit(91);
         ((void (*)(uint64_t, decltype(&service_listener), void *))syms.at(

@@ -1,5 +1,6 @@
 """Discover official Mac runtime channels without executing website JavaScript."""
 import http.client
+import functools
 import json
 import re
 import socket
@@ -74,112 +75,198 @@ def discover(channel='stable'):
                 compatibility_validated=False)
 
 
-def _ipv4_connection(address, timeout=None, source_address=None, **_options):
+def _archive_connection(address, timeout=None, source_address=None,
+                        family=socket.AF_UNSPEC, address_offset=0, **_options):
+    # The standard helper gives *each* address a fresh timeout. Keep one
+    # connection budget even when a CDN resolves to many unreachable hosts.
+    deadline = time.monotonic() + (timeout if isinstance(timeout, (int, float)) else 45)
     last_error = None
-    for family, kind, protocol, _canonical, target in socket.getaddrinfo(
-            address[0], address[1], socket.AF_INET, socket.SOCK_STREAM):
-        connection = socket.socket(family, kind, protocol)
+    addresses = socket.getaddrinfo(address[0], address[1], family, socket.SOCK_STREAM)
+    if addresses:
+        offset = address_offset % len(addresses)
+        addresses = addresses[offset:] + addresses[:offset]
+    for domain, kind, protocol, _canonical, target in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout('original archive connection timed out')
+        connection = socket.socket(domain, kind, protocol)
         try:
-            connection.settimeout(timeout)
+            connection.settimeout(min(10, remaining))
             if source_address:
                 connection.bind(source_address)
             connection.connect(target)
+            connection.settimeout(max(0.001, deadline - time.monotonic()))
             return connection
         except OSError as error:
             last_error = error
             connection.close()
-    raise last_error or OSError('no IPv4 address for the original archive server')
+    raise last_error or OSError('no address for the original archive server')
 
 
-class _IPv4HTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, *args, **kwargs):
+class _ArchiveHTTPSConnection(http.client.HTTPSConnection):
+    ipv4 = False
+
+    def __init__(self, *args, address_offset=0, **kwargs):
         super().__init__(*args, **kwargs)
-        self._create_connection = _ipv4_connection
+        self._create_connection = functools.partial(
+            _archive_connection, address_offset=address_offset,
+            family=socket.AF_INET if self.ipv4 else socket.AF_UNSPEC)
+
+    def connect(self):
+        super().connect()
+        self.sock.settimeout(15)
 
 
-class _IPv4HTTPSHandler(urllib.request.HTTPSHandler):
+class _IPv4HTTPSConnection(_ArchiveHTTPSConnection):
+    ipv4 = True
+
+
+class _ArchiveHTTPSHandler(urllib.request.HTTPSHandler):
     handler_order = 499
-    enabled = True
+    ipv4 = False
+    address_offset = 0
 
     def do_open(self, http_class, request, **kwargs):
-        if self.enabled and http_class is http.client.HTTPSConnection:
-            http_class = _IPv4HTTPSConnection
+        if http_class is http.client.HTTPSConnection:
+            http_class = _IPv4HTTPSConnection if self.ipv4 else _ArchiveHTTPSConnection
+            kwargs['address_offset'] = self.address_offset
         return super().do_open(http_class, request, **kwargs)
 
 
 def download_archive(opener, url, output):
-    """Resume interrupted official downloads; the caller verifies the full SHA."""
+    """Download bounded ranges; the caller verifies the complete archive SHA."""
     limit = 768 * 1024 * 1024
-    fallback = None
-    for attempt in range(3):
+    segment = 8 * 1024 * 1024
+    failures = 0
+    interruptions = 0
+    deadline = time.monotonic() + 30 * 60
+    full_size = None
+    validator = None
+    logged = output.tell()
+    transport = _ArchiveHTTPSHandler()
+    opener.add_handler(transport)
+    for _request in range(1024):
+        if time.monotonic() >= deadline:
+            raise OSError('original archive download exceeded its 30-minute deadline')
         offset = output.tell()
-        request = urllib.request.Request(url)
+        end = min(offset + segment, limit) - 1
+        if offset < 0 or offset >= limit:
+            raise ValueError('invalid original archive offset')
+        request = urllib.request.Request(url, headers={
+            'User-Agent': 'WeTypeX runtime download',
+            'Accept-Encoding': 'identity',
+            'Range': 'bytes=%d-%d' % (offset, end),
+        })
+        if offset and validator:
+            request.add_header('If-Range', validator)
         opener.archive_last_host = urllib.parse.urlsplit(url).hostname
-        if offset:
-            request.add_header('Range', 'bytes=' + str(offset) + '-')
         try:
             with opener.open(request, timeout=45) as response:
                 validate_url(response.geturl(), DOWNLOAD_HOSTS, allow_cdn=True)
+                if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                    raise ValueError('unexpected original archive content encoding')
                 if response.status == 206:
                     interval = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',
                                             response.headers.get('Content-Range', ''))
                     if not interval or int(interval[1]) != offset or not (
-                            offset <= int(interval[2]) < int(interval[3]) <= limit):
+                            offset <= int(interval[2]) <= end and
+                            int(interval[2]) < int(interval[3]) <= limit):
                         raise ValueError('invalid original archive range response')
                     expected = int(interval[2]) + 1
-                    full_size = int(interval[3])
+                    size = int(interval[3])
+                    length = response.headers.get('Content-Length')
+                    if length is not None and int(length) != expected - offset:
+                        raise ValueError('inconsistent original archive range length')
+                    if full_size is not None and full_size != size:
+                        raise ValueError('original archive changed during download')
+                    full_size = size
                 elif response.status == 200:
+                    # Range is optional. A full response replaces the prefix;
+                    # it must never be appended to previously downloaded data.
                     output.seek(0)
                     output.truncate()
                     offset = 0
+                    validator = None
                     length = response.headers.get('Content-Length')
-                    expected = int(length) if length else None
+                    expected = int(length) if length is not None else None
                     full_size = expected
                 else:
                     raise ValueError('unexpected original archive response')
-                if expected is not None and expected > limit:
+                if expected is not None and not (0 < expected <= limit):
                     raise ValueError('original archive exceeds its size limit')
+                tag = response.headers.get('ETag', '')
+                if re.fullmatch(r'"[\x21\x23-\x7e]*"', tag):
+                    if response.status == 206 and validator and validator != tag:
+                        raise ValueError('original archive validator changed during download')
+                    validator = tag
                 total = offset
+                transfer_start = progress_time = time.monotonic()
+                progress_bytes = total
                 while True:
-                    block = response.read(1024 * 1024)
+                    # read() can keep filling its buffer indefinitely while
+                    # tiny packets arrive. read1() returns after one I/O.
+                    block = response.read1(256 * 1024)
                     if not block:
                         break
                     total += len(block)
                     if total > limit or (expected is not None and total > expected):
                         raise ValueError('original archive exceeds its declared size')
                     output.write(block)
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise OSError('original archive download exceeded its 30-minute deadline')
+                    if now - progress_time >= 30:
+                        if total - progress_bytes < 256 * 1024:
+                            raise socket.timeout('original archive download made no useful progress')
+                        progress_time, progress_bytes = now, total
+                    # A trickling connection never reaches the socket timeout.
+                    # Keep its received prefix and reconnect to another address.
+                    if response.status == 206 and now - transfer_start >= 30 and total < expected:
+                        raise socket.timeout('original archive range transfer exceeded 30 seconds')
+                    if total - logged >= 32 * 1024 * 1024:
+                        print('Original archive downloaded: %d MiB' % (total // (1024 * 1024)),
+                              file=sys.stderr)
+                        logged = total
                 if expected is not None and total < expected:
                     raise http.client.IncompleteRead(b'', expected - total)
-                if full_size is not None and total < full_size:
-                    raise http.client.IncompleteRead(b'', full_size - total)
-                return
+                failures = 0
+                if full_size is None or total == full_size:
+                    return
+                # A complete 206 segment is success, not an interrupted
+                # download. Continue from its end without spending a retry.
+        # Python 3.8's socket.timeout is distinct from TimeoutError.
         except (urllib.error.URLError, http.client.HTTPException,
-                ConnectionError, TimeoutError, ssl.SSLError) as error:
-            if isinstance(error, ssl.SSLCertVerificationError):
+                ConnectionError, TimeoutError, socket.timeout, ssl.SSLError) as error:
+            if isinstance(error, ssl.SSLCertVerificationError) or (
+                    isinstance(error, urllib.error.URLError) and
+                    isinstance(error.reason, ssl.SSLCertVerificationError)):
                 raise
             if isinstance(error, urllib.error.HTTPError):
                 if error.code == 416 and offset:
                     output.seek(0)
                     output.truncate()
+                    full_size, validator = None, None
                 elif error.code not in (408, 429, 500, 502, 503, 504):
                     raise
-            if attempt == 2:
-                raise OSError('original archive download failed after three attempts: ' + str(error)) from error
-            if not isinstance(error, urllib.error.HTTPError) and hasattr(opener, 'add_handler'):
-                if fallback is None:
-                    fallback = _IPv4HTTPSHandler()
-                    opener.add_handler(fallback)
-                else:
-                    fallback.enabled = False
-                    # Retain certificate/hostname verification and TLS 1.3,
-                    # while avoiding oversized hybrid key shares on the last
-                    # connection attempt through older download gateways.
+            interruptions += 1
+            # Productive interruptions must not exhaust a cumulative retry
+            # counter on a large archive. The overall deadline still bounds it.
+            failures = 0 if output.tell() - offset >= 256 * 1024 else failures + 1
+            if failures >= 6:
+                raise OSError('original archive download failed after six attempts without useful progress: ' + str(error)) from error
+            transport.address_offset += 1
+            if not isinstance(error, urllib.error.HTTPError):
+                transport.ipv4 = True
+                if interruptions >= 2:
+                    # Keep IPv4 and certificate/hostname verification while
+                    # avoiding oversized hybrid key shares on old gateways.
                     context = ssl.create_default_context()
                     context.set_ecdh_curve('prime256v1')
                     if ssl.HAS_ALPN:
                         context.set_alpn_protocols(['http/1.1'])
-                    fallback._context = context
-            print('Original archive download interrupted at %s (%s); retrying (%d/3)' %
-                  (opener.archive_last_host, type(error).__name__, attempt + 2),
-                  file=sys.stderr)
-            time.sleep(attempt + 1)
+                    transport._context = context
+            print('Original archive download interrupted at %s (%s); resuming at %d MiB (%d/6 attempts without useful progress)' %
+                  (opener.archive_last_host, type(error).__name__,
+                   output.tell() // (1024 * 1024), failures), file=sys.stderr)
+            time.sleep(min(failures, 3))
+    raise OSError('original archive server returned too many partial responses')

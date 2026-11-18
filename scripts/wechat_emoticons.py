@@ -6,8 +6,13 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import zipfile
+
+vendor = pathlib.Path(__file__).resolve().parent / 'vendor'
+if vendor.is_dir():
+    sys.path.insert(0, str(vendor))
 
 FAMILY = 'WeTypeX WeChat Emoticons v1'
 ARCHIVE_PREFIX = ('WeType.app/Contents/MacOS/WeTypeSettings.app/Contents/'
@@ -89,7 +94,12 @@ def install_font(archive, data, metadata=None):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    subprocess.run(['fc-cache', '-f', str(directory)], check=True)
+    # Font registration is optional; an unavailable/read-only font cache must
+    # not prevent the verified original core from being installed.
+    try:
+        subprocess.run(['fc-cache', '-f', str(directory)], timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     return target
 
 

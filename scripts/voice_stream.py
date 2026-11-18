@@ -33,6 +33,23 @@ ADDRESS = '\0wetypex-voice-{}-{}'.format(os.getuid(), hashlib.sha256(str(STATE.r
 LIMIT = 131072
 
 
+def code_revision():
+    configured = os.environ.get('WETYPE_VOICE_REVISION', '')
+    if re.fullmatch('[a-f0-9]{64}', configured):
+        return configured
+    # Source-tree CLI usage has no generated wrapper.
+    root = Path(__file__).resolve().parent.parent
+    files = [root / name for name in ('scripts/voice_stream.py', 'scripts/local_voice.py', 'scripts/optional_voice.py', 'data/local-voice-model.json', 'data/optional-voice-models.json', 'src/sherpavoice/main.cpp', 'src/sherpavoice/c-api.h')]
+    files += sorted((root / 'src/localvoice').glob('*.rs'))
+    if not all(path.is_file() for path in files):
+        files = [Path(__file__).resolve()]
+    hashes = ''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '\n' for path in files)
+    return hashlib.sha256(hashes.encode()).hexdigest()
+
+
+REVISION = code_revision()
+
+
 def read_json(path):
     try:
         value = json.loads(path.read_text())
@@ -61,6 +78,11 @@ def punctuation(text, mode):
         import re
         text = re.sub(r'[，。！？；：、,.!?;:]+', ' ', text)
     return text
+
+
+def opencc_command():
+    sibling = Path(__file__).resolve().parents[2] / 'bin/opencc'
+    return str(sibling) if sibling.is_file() and os.access(sibling, os.X_OK) else shutil.which('opencc')
 
 
 def clipboard_helper():
@@ -197,7 +219,9 @@ def microphone_command(config):
                    '--format', 's16', '--latency', '20ms']
         if b'--properties' in options:
             command += ['--properties',
-                        'application.name=WeTypeX node.name=wetypex-voice-input'
+                        # Restored per-stream routing must not override the
+                        # selected microphone or this session's system default.
+                        'application.name=WeTypeX node.name=wetypex-voice-input node.dont-move=true'
                         + (' node.dont-fallback=true' if selected else '')]
         if selected:
             command += ['--target', str(microphone)]
@@ -227,6 +251,7 @@ def microphone_command(config):
 class Backend:
     def __init__(self, owner):
         self.owner = owner
+        self.provider = 'original'
         lease_root = DATA / 'fcitx5-wetypex'
         lease_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.runtime_lease = (lease_root / 'runtime-use.lock').open('a+')
@@ -265,10 +290,26 @@ class Backend:
         binary = SUPPORT / 'wetypex-engine-host'
         if not binary.is_file() or not (RUNTIME / 'manifest.txt').is_file():
             raise RuntimeError('请先安装并准备原版运行时')
+        try:
+            capabilities = subprocess.run(
+                [str(binary), str(SUPPORT), 'network-info'],
+                env=dict(os.environ, WETYPE_SUPPORT_DIR=str(SUPPORT)),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            if capabilities.returncode:
+                detail = capabilities.stderr.decode(errors='replace').strip()[-512:]
+                raise RuntimeError('无法检查原版语音的处理器兼容性：' + detail)
+            report = json.loads(capabilities.stdout)
+            if not isinstance(report, dict):
+                raise RuntimeError('无法读取原版语音的处理器兼容性信息')
+            if not report.get('voice_execution_ready', report.get('execution_ready', True)):
+                raise RuntimeError('此 CPU 的原版语音需要兼容组件，请安装或更新 qemu-user；Nix 请启用 enableCompatibilityProvider')
+        except (OSError, ValueError, subprocess.TimeoutExpired, RuntimeError) as error:
+            self.runtime_lease.close()
+            raise RuntimeError(str(error)) from error
         # This process outlives the recording thread that creates it.
         # --die-with-parent also triggers when that *thread* exits; stdin EOF
         # already shuts down the voice service when the controller exits.
-        wrapper = shutil.which('bwrap')
+        wrapper = shutil.which(os.environ.get('WETYPE_SANDBOX') or 'bwrap')
         if not wrapper:
             raise RuntimeError('请先安装 Bubblewrap')
         command = [wrapper, '--unshare-pid',
@@ -348,6 +389,85 @@ class Backend:
         self.runtime_lease.close()
 
 
+class LocalBackend(Backend):
+    def __init__(self, owner, model):
+        import local_voice
+        self.owner, self.provider = owner, 'local'
+        self.model = model
+        if model == 'wetype':
+            root = local_voice.ROOT
+        else:
+            import optional_voice
+            optional_voice.profile(model)
+            root = optional_voice.ROOT
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.runtime_lease = (root / 'use.lock').open('a+')
+        try:
+            try:
+                fcntl.flock(self.runtime_lease, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError('离线模型正在更新，请稍后重试') from error
+            self.model_path, runtime_path = local_voice.resolve_model(model, full=True)
+            binary = SUPPORT / ('wetypex-local-voice' if model == 'wetype' else 'wetypex-sherpa-voice')
+            wrapper = shutil.which(os.environ.get('WETYPE_SANDBOX') or 'bwrap')
+            if not wrapper or not os.access(binary, os.X_OK):
+                raise RuntimeError('当前安装缺少离线语音组件或 Bubblewrap，请更新 WeTypeX')
+            command = [wrapper, '--unshare-net', '--unshare-pid',
+                       '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib',
+                       '--ro-bind-try', '/lib64', '/lib64', '--symlink', 'usr/bin', '/bin',
+                       '--ro-bind-try', '/nix/store', '/nix/store',
+                       '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                       '--ro-bind', str(self.model_path), '/model',
+                       '--ro-bind', str(SUPPORT), '/support']
+            if runtime_path:
+                command += ['--ro-bind', str(runtime_path), '/asr-runtime']
+            workspace = VOICE / 'local-work'
+            workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+            command += ['--bind', str(workspace), '/work', '--chdir', '/work',
+                       '--setenv', 'WETYPE_LOCAL_VOICE_CPU', os.environ.get('WETYPE_LOCAL_VOICE_CPU', 'auto'),
+                       '/support/' + binary.name, '--model', '/model']
+            if runtime_path:
+                command += ['/asr-runtime', model]
+            self.ready = threading.Event()
+            self.write_lock = threading.Lock()
+            self.vad, self.broken = False, False
+            self.log = (VOICE / 'local-backend.log').open('wb')
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=self.log, bufsize=65536, env={})
+            os.set_blocking(self.process.stdin.fileno(), False)
+            threading.Thread(target=self.receive, daemon=True).start()
+        except BaseException:
+            self.runtime_lease.close()
+            raise
+
+    def send(self, message):
+        op = message['op']
+        code = {'start': b'S', 'pcm': b'P', 'stop': b'T', 'finish': b'F', 'cancel': b'C'}[op]
+        data = bytes.fromhex(message['data']) if op == 'pcm' else message.get('token', '').encode()
+        with self.write_lock:
+            payload = memoryview(code + struct.pack('<I', len(data)) + data)
+            deadline = time.monotonic() + (10 if self.model == 'wetype' else 120)
+            try:
+                while payload:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([], [self.process.stdin], [], remaining)[1]:
+                        raise RuntimeError('离线语音处理未能跟上录音，请分段输入')
+                    try:
+                        payload = payload[os.write(self.process.stdin.fileno(), payload):]
+                    except BlockingIOError:
+                        continue
+            except (OSError, ValueError) as error:
+                self.broken = True
+                raise RuntimeError('离线语音服务已停止，请重新开始语音输入') from error
+            except RuntimeError:
+                self.broken = True
+                raise
+
+    def close(self):
+        with self.write_lock:
+            super().close()
+
+
 class Job:
     def __init__(self, owner, request):
         self.owner = owner
@@ -357,16 +477,22 @@ class Job:
         self.pid = int(request.get('pid', 0))
         self.request = request
         self.config = read_json(CONFIG)
+        self.provider = self.config.get('voice_provider', 'original')
+        if request.get('provider') == 'local':
+            self.provider = 'local'
+        self.local_model = request.get('model', self.config.get('local_voice_model', 'wetype'))
         self.capture = None
         self.capture_backend = ''
         self.reader = None
         self.backend = None
+        self.converter = None
         self.cancelled = False
         self.started = False
         self.stopped = threading.Event()
         self.done = threading.Event()
         self.immediate = False
         self.stop_sent = False
+        self.limit_reached = False
         self.error = ''
         self.text = ''
         self.since = time.monotonic()
@@ -377,7 +503,7 @@ class Job:
         self.stopped_at = None
         self.timing = {}
         self.last_level = 0
-        self.chunks = queue.Queue(maxsize=500)
+        self.chunks = queue.Queue(maxsize=6000 if self.provider == 'local' and self.local_model != 'wetype' else 500)
 
     def stop_capture(self):
         if self.stopped_at is None:
@@ -392,6 +518,17 @@ class Job:
     def stop(self, immediate=False):
         self.immediate |= immediate
         self.stop_capture()
+        if immediate and self.provider == 'local' and self.text and not self.done.is_set():
+            # Enter confirms the current displayed result. Do not wait for
+            # buffered audio to decode before honoring an immediate submit.
+            self.timing['stop_to_final_ms'] = round((time.monotonic() - self.stopped_at) * 1000)
+            text = punctuation(self.text, self.config.get('voice_punctuation', '智能标点'))
+            self.owner.publish(self, 'final', text, error='', reason='immediate')
+            self.done.set()
+            if self.backend and self.backend.process.poll() is None:
+                self.backend.broken = True
+                self.backend.process.kill()
+            return
         self.owner.publish(self, 'recognizing', self.text)
         if immediate and self.stop_sent:
             try:
@@ -402,7 +539,12 @@ class Job:
     def cancel(self):
         self.cancelled = True
         self.stop_capture()
-        if self.started and self.backend and self.backend.process.poll() is None:
+        if self.backend and self.provider == 'local' and self.backend.process.poll() is None:
+            # Kill the isolated decoder rather than queue cancellation behind
+            # buffered PCM on a slow CPU. The next session reloads on demand.
+            self.backend.broken = True
+            self.backend.process.kill()
+        elif self.started and self.backend and self.backend.process.poll() is None:
             try:
                 self.backend.send({'op': 'cancel', 'token': self.token})
             except (OSError, RuntimeError):
@@ -462,6 +604,17 @@ class Job:
         try:
             if self.cancelled or self.done.is_set():
                 return
+            if self.provider not in ('original', 'local'):
+                raise RuntimeError('语音识别方式无效，请在设置中重新选择')
+            if self.provider == 'local':
+                import local_voice
+                local_voice.resolve_model(self.local_model)
+                if self.request.get('traditional'):
+                    self.converter = opencc_command()
+                    if not self.converter:
+                        raise RuntimeError('本地语音繁体输出需要 OpenCC，请安装 opencc 后重试')
+            elif self.config.get('standalone', False):
+                raise RuntimeError('单机模式下请在语音设置中选择本地离线识别')
             recording_log = (VOICE / 'capture.log').open('wb')
             if self.request.get('file'):
                 self.capture_backend = 'file'
@@ -481,13 +634,14 @@ class Job:
             self.reader = threading.Thread(target=self.capture_audio, daemon=True)
             self.reader.start()
             self.backend = self.owner.get_backend(self)
-            if not self.backend or not self.backend.ready.wait(20):
+            if not self.backend or not self.backend.ready.wait(120 if self.provider == 'local' and self.local_model != 'wetype' else 20):
                 raise RuntimeError('连接语音服务超时')
             self.timing['backend_ready_ms'] = round((time.monotonic() - self.since) * 1000)
             if self.backend.broken or self.backend.process.poll() is not None:
-                raise RuntimeError('原版语音服务启动失败，请检查 voice/backend.log')
+                raise RuntimeError('离线语音服务启动失败，请检查 voice/local-backend.log' if self.provider == 'local'
+                                   else '原版语音服务启动失败，请检查 voice/backend.log')
             if not self.owner.send(self, {'op': 'start',
-                                         'polish': bool(self.config.get('voice_smart_polish', True)),
+                                         'polish': self.provider == 'original' and bool(self.config.get('voice_smart_polish', True)),
                                          'traditional': bool(self.request.get('traditional'))}):
                 return
             while not self.cancelled and not self.done.is_set():
@@ -508,7 +662,7 @@ class Job:
             self.stop_sent = True
             self.owner.publish(self, 'recognizing', self.text)
             self.owner.send(self, {'op': 'finish' if self.immediate else 'stop'})
-            if not self.done.wait(45):
+            if not self.done.wait(120 if self.provider == 'local' and self.local_model != 'wetype' else 45):
                 raise RuntimeError('语音识别超时')
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             self.owner.fail(self, str(error))
@@ -579,6 +733,9 @@ class Service:
                                token=job.token, session=job.session,
                                epoch=job.epoch, state=state, text=text,
                                capture_backend=job.capture_backend,
+                               provider=job.provider,
+                               limit_reached=job.limit_reached,
+                               truncated=job.limit_reached and bool(job.request.get('file')),
                                timings=dict(job.timing), **extra)
             self.last_activity = time.monotonic()
             self.last_native_activity = self.last_activity
@@ -590,14 +747,16 @@ class Service:
         with self.backend_lock:
             if job.cancelled:
                 return None
-            identity = read_json(ACCOUNT / 'identity.json')
+            identity = read_json(ACCOUNT / 'identity.json') if job.provider == 'original' else {}
             signature = (identity.get('uin'), identity.get('device_code'))
-            if self.backend and (self.backend.broken or self.backend.process.poll() is not None or
-                                 signature != self.backend.identity):
+            changed = self.backend and (self.backend.provider != job.provider or
+                      (job.provider == 'original' and signature != self.backend.identity) or
+                      (job.provider == 'local' and self.backend.model != job.local_model))
+            if self.backend and (self.backend.broken or self.backend.process.poll() is not None or changed):
                 self.backend.close()
                 self.backend = None
             if self.backend is None:
-                self.backend = Backend(self)
+                self.backend = LocalBackend(self, job.local_model) if job.provider == 'local' else Backend(self)
             return self.backend
 
     def trim_backend(self):
@@ -615,10 +774,18 @@ class Service:
             if self.job is not job or job.cancelled or job.done.is_set():
                 return False
             message['token'] = job.token
-            job.backend.send(message)
+            if job.provider != 'local':
+                job.backend.send(message)
+                if message['op'] == 'start':
+                    job.started = True
+                return True
             if message['op'] == 'start':
                 job.started = True
-            return True
+            backend = job.backend
+        # A bounded local decoder can apply backpressure. Do not hold the
+        # control lock while writing PCM: Esc/focus loss must remain immediate.
+        backend.send(message)
+        return True
 
     def receive(self, backend, event):
         with self.condition:
@@ -626,7 +793,21 @@ class Service:
             if not job or job.backend is not backend or job.token != event.get('token') or job.cancelled or job.done.is_set():
                 return
             kind = event.get('event')
+            if job.provider == 'local' and job.request.get('traditional') and event.get('text'):
+                try:
+                    converted = subprocess.run([job.converter, '-c', 's2t.json'], input=event['text'],
+                                               encoding='utf-8', capture_output=True, timeout=2)
+                    if converted.returncode:
+                        raise RuntimeError('OpenCC 无法转换繁体输出，请检查安装')
+                    event['text'] = converted.stdout
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    self.fail(job, str(error))
+                    return
+            if job.provider == 'local' and len(json.dumps(event.get('text', ''), ensure_ascii=False).encode()) > 58000:
+                self.fail(job, '识别结果过长，请分段输入')
+                return
             if kind == 'state' and event.get('state') in (2, 3):
+                job.limit_reached = bool(event.get('limit'))
                 job.stop_capture()
                 self.publish(job, 'recognizing', job.text)
             elif kind == 'partial':
@@ -649,7 +830,8 @@ class Service:
                 if job.stopped_at is not None:
                     job.timing['stop_to_final_ms'] = round((time.monotonic() - job.stopped_at) * 1000)
                 self.publish(job, 'final' if text else 'error', text,
-                             error='' if text else (job.error or '没有识别到语音'), reason=event.get('reason'))
+                             error='' if text else (job.error or '没有识别到语音'),
+                             reason='duration_limit' if job.limit_reached else event.get('reason'))
                 job.done.set()
                 # The focused input context acknowledges an accepted final
                 # result with 'copy'. Discarded/stale results never copy.
@@ -657,7 +839,7 @@ class Service:
     def backend_failed(self, backend):
         with self.condition:
             if self.job and self.job.backend is backend and not self.job.done.is_set():
-                self.fail(self.job, '原版语音服务已退出，请检查 voice/backend.log')
+                self.fail(self.job, '离线语音服务已退出，请重新启动语音输入' if backend.provider == 'local' else '原版语音服务已退出，请检查 voice/backend.log')
 
     def fail(self, job, message):
         with self.condition:
@@ -667,6 +849,17 @@ class Service:
             job.cancel()
 
     def request(self, request):
+        if request.get('op') == 'release-local':
+            with self.backend_lock:
+                with self.condition:
+                    if self.job and not self.job.done.is_set() and self.job.provider == 'local':
+                        return {'ok': False, 'error': '离线语音正在录音或识别，请结束后重试'}
+                    backend = self.backend if self.backend and self.backend.provider == 'local' else None
+                    if backend:
+                        self.backend = None
+                if backend:
+                    backend.close()
+            return {'ok': True}
         with self.condition:
             self.last_activity = time.monotonic()
             op = request.get('op')
@@ -743,7 +936,7 @@ class Service:
                         self.job.cancel()
                     else:
                         self.job.stop(op == 'finish')
-            return dict(self.latest, ok=True, daemon_pid=os.getpid(),
+            return dict(self.latest, ok=True, daemon_pid=os.getpid(), voice_protocol=2, voice_revision=REVISION,
                         native_pid=self.backend.process.pid if self.backend and self.backend.process.poll() is None else None,
                         capture_pid=self.job.capture.pid if self.job and self.job.capture and self.job.capture.poll() is None else None,
                         native_ready=bool(self.backend and not self.backend.broken and self.backend.ready.is_set() and self.backend.process.poll() is None),
@@ -801,7 +994,7 @@ def serve():
     def terminate(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
-    if (DATA/'fcitx5-wetypex/runtime-transaction.json').exists():
+    if read_json(CONFIG).get('voice_provider') != 'local' and (DATA/'fcitx5-wetypex/runtime-transaction.json').exists():
         setup=Path(__file__).with_name('setup_runtime.py')
         subprocess.run([sys.executable,str(setup),'--activate-pending'],
                        stdout=subprocess.DEVNULL,check=True,timeout=120)
@@ -817,7 +1010,7 @@ def serve():
         with Server(ADDRESS, Handler) as server:
             service = server.service = Service()
             server.timeout = .25
-            atomic_json(VOICE / 'control.json', dict(version=1, address=ADDRESS[1:], pid=os.getpid()))
+            atomic_json(VOICE / 'control.json', dict(version=1, voice_protocol=2, voice_revision=REVISION, address=ADDRESS[1:], pid=os.getpid()))
             try:
                 while True:
                     server.handle_request()
@@ -858,9 +1051,9 @@ def serve():
                         service.clipboard_owner.wait()
 
 
-def connect():
+def connect(legacy_control=False, require_namespace=False):
     deadline = time.monotonic() + 10
-    launched = False
+    launched = None
     while time.monotonic() < deadline:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -868,14 +1061,43 @@ def connect():
             if not peer_is_self(connection):
                 raise RuntimeError('语音服务身份不匹配')
             connection.settimeout(55)
+            metadata = read_json(VOICE / 'control.json')
+            peer_pid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+            # Sibling Flatpak instances cannot see each other's PIDs and get
+            # zero from SO_PEERCRED. Status/control can cross that boundary,
+            # while audio jobs need a controller in their own PID namespace so
+            # owner-exit monitoring and sandbox lifetimes remain valid.
+            if peer_pid and metadata.get('pid') != peer_pid:
+                connection.close()
+                time.sleep(.05)
+                continue
+            foreign_namespace = require_namespace and peer_pid == 0
+            if not legacy_control and (foreign_namespace or metadata.get('voice_protocol') != 2 or metadata.get('voice_revision') != REVISION):
+                # Never send audio/start to a pre-local-mode daemon: it would
+                # ignore the provider setting and could start online ASR.
+                connection.sendall(b'{"op":"status"}\n')
+                report = json.loads(connection.makefile('rb').readline(LIMIT))
+                connection.close()
+                if report.get('state') in ('recording', 'recognizing', 'polishing'):
+                    if foreign_namespace:
+                        raise RuntimeError('另一个会话正在使用语音服务，请结束后重试')
+                    raise RuntimeError('升级后的语音组件需要重新加载，请结束当前语音输入后重试')
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as old:
+                    old.settimeout(3)
+                    old.connect(ADDRESS)
+                    if not peer_is_self(old):
+                        raise RuntimeError('语音服务身份不匹配')
+                    old.sendall(b'{"op":"shutdown"}\n')
+                    old.recv(4096)
+                time.sleep(.1)
+                continue
             return connection
         except (ConnectionRefusedError, FileNotFoundError):
             connection.close()
-            if not launched:
-                launched = True
+            if launched is None or launched.poll() is not None:
                 VOICE.mkdir(mode=0o700, parents=True, exist_ok=True)
                 with (VOICE / 'daemon.log').open('wb') as log:
-                    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'serve'],
+                    launched = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'serve'],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=log, start_new_session=True, close_fds=True)
             time.sleep(.05)
@@ -885,11 +1107,39 @@ def connect():
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('start', 'stop', 'finish', 'cancel', 'copy', 'status', 'serve', 'transcribe', 'shutdown', 'quiesce'))
+    parser.add_argument('command', choices=('start', 'stop', 'finish', 'cancel', 'copy', 'status', 'serve', 'transcribe', 'shutdown', 'quiesce', 'model'))
     parser.add_argument('args', nargs='*')
     parser.add_argument('--realtime', action='store_true')
     parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--traditional', action='store_true')
+    parser.add_argument('--archive')
+    parser.add_argument('--model', help='local voice model ID (see model list)')
+    parser.add_argument('--accept-upstream-license', action='store_true')
     options = parser.parse_args()
+    if options.model and options.command not in ('model', 'transcribe'):
+        parser.error('--model is supported by model and transcribe')
+    if options.command == 'model':
+        import local_voice
+        if options.args and options.args[0] in ('install', 'remove'):
+            # Releasing an idle local decoder permits model replacement and
+            # removal without disrupting online dictation or paired devices.
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(5)
+            try:
+                connection.connect(ADDRESS)
+                if not peer_is_self(connection):
+                    raise RuntimeError('语音服务身份不匹配')
+                connection.sendall(b'{"op":"release-local"}\n')
+                reply = json.loads(connection.makefile('rb').readline(LIMIT))
+                if not reply.get('ok'):
+                    raise RuntimeError(reply.get('error', '离线模型正在使用'))
+            except (FileNotFoundError, ConnectionRefusedError):
+                pass
+            finally:
+                connection.close()
+        result = local_voice.command(options.args, options.archive, options.accept_upstream_license, options.model)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if options.command == 'serve':
         serve()
         return 0
@@ -899,7 +1149,7 @@ def main():
         request.update(session=int(args[0]) if args else 0,
                        epoch=int(args[1]) if len(args) > 1 else 0,
                        token=args[2] if len(args) > 2 else uuid.uuid4().hex,
-                       traditional=len(args) > 3 and args[3] == '1', pid=os.getppid())
+                       traditional=options.traditional or (len(args) > 3 and args[3] == '1'), pid=os.getppid())
         stamp = request['token'].split('-', 1)
         if request['session'] and len(stamp) == 2 and all(part.isdigit() for part in stamp):
             # A helper can be reparented before Python starts. The input
@@ -909,11 +1159,14 @@ def main():
         if not options.args:
             parser.error('transcribe requires an audio file')
         request.update(file=str(Path(options.args[0]).resolve()), token=uuid.uuid4().hex,
-                       pid=os.getpid(), realtime=options.realtime)
+                       pid=os.getpid(), realtime=options.realtime, traditional=options.traditional)
     elif options.args:
         request['token'] = options.args[0]
+    if options.model and options.command == 'transcribe':
+        request.update(provider='local', model=options.model)
     try:
-        connection = connect()
+        connection = connect(options.command in ('stop', 'finish', 'cancel', 'shutdown', 'quiesce'),
+                             options.command in ('start', 'transcribe'))
     except (OSError, RuntimeError) as error:
         if options.command == 'start' and request['session']:
             atomic_json(STATE / 'voice-inbox.json', dict(request, version=time.monotonic_ns(),
@@ -931,6 +1184,8 @@ def main():
                 print(json.dumps(event, ensure_ascii=False), file=sys.stderr)
             if event.get('state') in ('final', 'error', 'cancelled'):
                 result = dict(event, ok=event['state'] == 'final')
+                if result.get('truncated'):
+                    print('已达到本地语音十分钟上限，文件只转写了前十分钟。', file=sys.stderr)
                 print(json.dumps(result, ensure_ascii=False))
                 return 0 if result['ok'] else 1
     return 1

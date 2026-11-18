@@ -54,6 +54,8 @@ Arch 包在 `package()` 中为 `locale.so` 和 `wcwss_bridge.so` 设置可执行
 
 ## ARM64
 
+旧发行版的 ARM64 构建使用 LLVM 签名 APT 仓库中的 Clang 18。[官方公钥](../packaging/keys/llvm-snapshot.asc)来自 `https://apt.llvm.org/llvm-snapshot.gpg.key`，随构建文件保存；镜像先核对固定指纹，再启用签名仓库，无需每次重新下载公钥。
+
 ARM64 软件包由 `.github/workflows/packages-arm64.yml` 在原生 ARM64 运行器上构建：deb、legacy deb 与 rpm 在目标发行版容器中原生编译，Arch 包在固定摘要的 Arch Linux ARM 环境中构建。ARM64 构建额外编译使用 Apple 替代字符串布局的私有 libc++（LLVM 18.1.8 源码，散列固定在 `PKGBUILD.in`），需要 CMake 3.20+ 和 Clang 16+。Arch ARM 包把 `qemu-user` 列为可选依赖。运行方式见 [ARM64 支持](arm64.md)。
 
 ## 版本号
@@ -73,12 +75,25 @@ ARM64 软件包由 `.github/workflows/packages-arm64.yml` 在原生 ARM64 运行
 
 ## GitHub Release
 
-推送 `v<版本>-<修订>` 标签会启动 `release.yml`。也可以为已有标签手动触发：
+推送 `v<版本>-<修订>` 标签会启动 `release.yml`。x86-64 与 ARM64 并行构建，发布作业随后检查源码来源、两种架构的包元数据和全部 SHA-256。所有文件校验通过后才公开草稿，最后同步 AUR。也可以为已有标签手动触发：
 
 ```bash
 gh workflow run release.yml -f tag=v<版本>-<修订>
 gh workflow run release.yml -f tag=v<版本>-<修订> -f only_aur=true   # 只发布 AUR 元数据
 ```
+
+### 恢复中断的发布
+
+编译完成、上传或公开 Release 失败时，先找到失败的发布运行 ID。用已保存的构建产物做一次只读验证：
+
+```bash
+gh workflow run release.yml --ref main \
+  -f tag=v<版本>-<修订> -f recover_run=<失败运行ID> -F dry_run=true
+```
+
+验证通过后，去掉 `-F dry_run=true` 重复执行即可恢复发布，不需要重新编译。恢复时会核对运行所属仓库与工作流、标签提交、构建来源、GitHub 记录的 ZIP 散列、源码归档和所有包的版本、架构与校验和。验证模式不会公开 Release 或同步 AUR。
+
+发布草稿通过数字 ID 查询和公开，不使用只返回已发布版本的按标签查询接口。完整的公开版本保持原有文件与校验和；草稿中已上传且散列一致的文件也会复用。新流水线将构建与发布分为独立作业，重跑失败的发布作业会保留已成功的构建。
 
 原版更新自动化在 `release` 模式下会自行创建标签并触发发布，见[维护者自动化](maintainer-automation.md#标签与发布)。
 
@@ -135,5 +150,23 @@ AUR 发布需要仓库机密 `AUR_SSH_PRIVATE_KEY`，其公钥需登记在 AUR �
 正式投递前，在目标系统上用包管理器安装 deb，确认依赖可从其仓库解析，并验证首次运行时设置、添加输入法、候选上屏、V 快捷栏、升级与卸载。投递材料包括软件包、对应 SHA-256、图标、设置和候选界面截图，以及首次设置说明。商店版本沿用 `fcitx5-wetypex` 包名和项目版本，便于与现有安装互相升级。
 
 星火官方的 [Git Releases 自动更新服务](https://gitee.com/spark-building-service/github) 可以跟随本仓库的 Release 更新。其 `file_list` 使用文件名模板：标准包为 `fcitx5-wetypex_{version}_amd64.deb`（ARM64 为 `_arm64.deb`），legacy 包为 `fcitx5-wetypex-legacy_{version}_amd64.deb`；`{version}` 是去掉 `v` 前缀、包含打包修订号的完整版本。请在目标系统验证后为每个架构选定其中一种包，不要同时配置两套模板。
+
+仓库提供两套可直接交给该服务的配置：
+
+- [`packaging/spark/standard/github.json`](../packaging/spark/standard/github.json)：标准 deb，包含 amd64 和 arm64。
+- [`packaging/spark/legacy/github.json`](../packaging/spark/legacy/github.json)：legacy deb，包含 amd64 和 arm64。
+
+它们使用相同的包名和 `{version}` 模板，后续 Release 中的完整修订号也会保留。根据目标系统的依赖选择一套提交；legacy 包使用 OpenSSL 1.1，不能仅因 glibc 基线较低就把它当成所有新系统的通用包。
+
+使用星火官方 `github-downloader` 验证时，先把所选配置复制到工作目录，避免其写入的 `github-local.json` 混进投递文件：
+
+```bash
+mkdir -p build/spark-submit
+cp packaging/spark/standard/github.json build/spark-submit/
+github-downloader --data build/spark-submit --category tools \
+  --output build/spark-download --dry-run
+```
+
+投递前补齐商店需要的图标与截图，并完成目标系统的安装和输入验证。配置文件和下载地址检查通过不代表商店已收录。
 
 本节提供投递材料与验证清单；商店上架是单独的发布操作。

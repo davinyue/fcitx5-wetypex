@@ -1,5 +1,7 @@
+#include "../common/appearance.hpp"
 #include "../common/qt_helpers.hpp"
 #include "original_windows.hpp"
+#include <fcitxqtkeysequencewidget.h>
 
 #include <QApplication>
 #include <QButtonGroup>
@@ -25,6 +27,7 @@
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -32,11 +35,14 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSlider>
+#include <QSpinBox>
 #include <QStackedWidget>
 #include <QTimer>
 #include <QUrl>
 #include <algorithm>
 #include <functional>
+#include <fcntl.h>
+#include <unistd.h>
 #include <tuple>
 
 using namespace original_ui;
@@ -91,6 +97,12 @@ static bool writeFile(const QString &name, const QByteArray &bytes) {
 }
 static bool writeSetting(const QString &key, const QJsonValue &value) {
   auto settings = readSettings();
+  if ((key == "page_size" || key == "vertical" ||
+       key == "candidate_label_style" || key == "preedit_position" ||
+       key == "candidate_size" || key == "theme_mode" ||
+       key == "chinese_punctuation" || key == "remember_punctuation") &&
+      settings.value(key) == value)
+    return true;
   settings[key] = value;
   if (!writeFile(configDir() + "/wetypex.json",
                  QJsonDocument(settings).toJson()))
@@ -103,10 +115,18 @@ static bool writeSetting(const QString &key, const QJsonValue &value) {
 static QJsonObject engineControl(const QJsonObject &request,
                                  QString *error = nullptr) {
   QLocalSocket socket;
-  socket.connectToServer(
+  const QString stateDirectory =
       QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
-      "/fcitx5-wetypex/state/control.sock");
-  if (!socket.waitForConnected(1500)) {
+      "/fcitx5-wetypex/state";
+  const int directory = open(QFile::encodeName(stateDirectory).constData(),
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  socket.connectToServer(directory >= 0
+      ? QStringLiteral("/proc/self/fd/%1/control.sock").arg(directory)
+      : stateDirectory + QStringLiteral("/control.sock"));
+  const bool connected = socket.waitForConnected(1500);
+  if (directory >= 0)
+    close(directory);
+  if (!connected) {
     // The official settings app can edit common phrases even before its input
     // service is active. Use the same engine protocol in a short-lived process
     // when the resident Fcitx addon has no control socket yet.
@@ -244,7 +264,9 @@ static QMap<QString, QString> readAppearance() {
   if (!file.open(QIODevice::ReadOnly))
     return result;
   for (const auto &line : QString::fromUtf8(file.readAll()).split('\n')) {
-    if (line.startsWith('#'))
+    if (line.trimmed().startsWith('['))
+      break;
+    if (line.trimmed().startsWith('#') || line.trimmed().startsWith(';'))
       continue;
     int equals = line.indexOf('=');
     if (equals <= 0)
@@ -255,14 +277,6 @@ static QMap<QString, QString> readAppearance() {
     result[line.left(equals).trimmed()] = value;
   }
   return result;
-}
-static void setIni(QString &text, const QString &key, const QString &value) {
-  QRegularExpression expression("^" + QRegularExpression::escape(key) + "=.*$",
-                                QRegularExpression::MultilineOption);
-  if (text.contains(expression))
-    text.replace(expression, key + "=" + value);
-  else
-    text += key + "=" + value + "\n";
 }
 static QFrame *rowsCard(const QList<QWidget *> &rows) {
   auto *frame = card();
@@ -313,6 +327,7 @@ static QWidget *iconRow(const QString &icon, const QString &title,
   if (!subtitle.isEmpty()) {
     auto *detail = new QLabel(subtitle);
     detail->setObjectName("rowSubtitle");
+    detail->setWordWrap(true);
     labels->addWidget(detail);
   }
   labels->addStretch();
@@ -557,31 +572,416 @@ static QWidget *shortcutRow(const QString &title, bool checked,
                      [setting](bool value) { writeSetting(setting, value); });
   return container;
 }
-static void applyClassicTheme(int mode, int size, QLabel *status) {
+static QStringList configuredKeyCaps(const QString &setting, const char *fallback) {
+  const auto value = readSettings().value(setting).toString(QString::fromLatin1(fallback));
+  QStringList caps;
+  for (const auto &key : fcitx::Key::keyListFromString(value.toStdString())) {
+    if (!caps.isEmpty())
+      caps << "backslash-icon";
+    const auto normalized = key.normalize();
+    if (normalized == fcitx::Key("Shift+space").normalize()) {
+      caps << "Shift" << "空格";
+    } else {
+      const fcitx::KeyList single{normalized};
+      auto text = QString::fromStdString(fcitx::Key::keyListToString(
+          single, fcitx::KeyStringFormat::Localized));
+      if (normalized.sym() == fcitx::Key("space").sym())
+        text.replace("Space", "空格", Qt::CaseInsensitive);
+      caps << text;
+    }
+  }
+  if (caps.isEmpty())
+    caps << "未绑定";
+  return caps;
+}
+static QList<fcitx::Key> voiceShortcutKeys(const QString &setting,
+                                         const char *fallback) {
+  const auto settings = readSettings();
+  const auto value = settings.contains(setting) ? settings.value(setting).toString()
+                                                 : QString::fromLatin1(fallback);
+  QList<fcitx::Key> keys;
+  for (const auto &key : fcitx::Key::keyListFromString(value.toStdString()))
+    keys.append(key.normalize());
+  return keys;
+}
+class VoiceShortcutLayout final : public QWidget {
+  QBoxLayout *layout_;
+  QWidget *bindings_;
+  bool narrow_ = false;
+
+public:
+  VoiceShortcutLayout(const QString &title, const QString &subtitle,
+                      QAbstractButton *check, QWidget *bindings)
+      : bindings_(bindings) {
+    layout_ = new QBoxLayout(QBoxLayout::LeftToRight, this);
+    layout_->setContentsMargins(15, 6, 15, 6);
+    layout_->setSpacing(8);
+    auto *labels = new QWidget;
+    auto *left = new QHBoxLayout(labels);
+    left->setContentsMargins(0, 0, 0, 0);
+    left->setSpacing(8);
+    left->addWidget(check);
+    auto *text = new QVBoxLayout;
+    text->setContentsMargins(0, 0, 0, 0);
+    text->setSpacing(2);
+    text->addStretch();
+    auto *heading = new QLabel(title);
+    heading->setObjectName("rowTitle");
+    text->addWidget(heading);
+    auto *detail = new QLabel(subtitle);
+    detail->setObjectName("rowSubtitle");
+    detail->setWordWrap(true);
+    text->addWidget(detail);
+    text->addStretch();
+    left->addLayout(text, 1);
+    layout_->addWidget(labels, 1);
+    layout_->addWidget(bindings, 0, Qt::AlignVCenter);
+    setMinimumHeight(74);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+  }
+
+protected:
+  void resizeEvent(QResizeEvent *event) override {
+    QWidget::resizeEvent(event);
+    const bool narrow = width() < (narrow_ ? 636 : 620);
+    if (narrow != narrow_) {
+      narrow_ = narrow;
+      layout_->setDirection(narrow ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+      layout_->setAlignment(bindings_, narrow ? Qt::AlignRight : Qt::AlignVCenter);
+      setMinimumHeight(narrow ? 112 : 74);
+    }
+  }
+};
+static QWidget *voiceShortcutRow(const QString &title, const QString &subtitle,
+                                 const QString &enabledSetting,
+                                 const QString &keySetting,
+                                 const char *fallback) {
+  auto *editor = new fcitx::FcitxQtKeySequenceWidget;
+  editor->setObjectName("voice-key-" + keySetting);
+  editor->setModifierOnlyAllowed(true);
+  editor->setModifierlessAllowed(true);
+  editor->setMultiKeyShortcutsAllowed(false);
+  editor->setClearButtonShown(true);
+  editor->setMinimumWidth(160);
+  editor->setMaximumWidth(320);
+  editor->setToolTip("点击录入快捷键，支持右 Alt 等单独修饰键；Esc 取消录入");
+  editor->setKeySequence(voiceShortcutKeys(keySetting, fallback));
+  for (auto *clear : editor->findChildren<QToolButton *>()) {
+    clear->setIcon(QIcon());
+    clear->setText("清空");
+    clear->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    clear->setFixedWidth(44);
+    clear->setStyleSheet("QToolButton{background:#f1f1f1;color:#606266;border:1px solid #d9d9d9;"
+                        "border-radius:4px;min-height:26px;font-size:12px;padding:0 4px;}");
+  }
+  auto *defaults = new QPushButton("默认");
+  defaults->setMinimumWidth(60);
+  defaults->setToolTip("恢复原版默认快捷键");
+  auto *bindings = new QWidget;
+  auto *bindingLayout = new QHBoxLayout(bindings);
+  bindingLayout->setContentsMargins(0, 0, 0, 0);
+  bindingLayout->setSpacing(4);
+  bindingLayout->addWidget(editor);
+  bindingLayout->addWidget(defaults);
+  auto *check = new Check;
+  auto *container = new VoiceShortcutLayout(title, subtitle, check, bindings);
+  check->setObjectName("voice-toggle-" + enabledSetting);
+  check->setChecked(wetype::settingBool(readSettings().value(enabledSetting), true));
+  QObject::connect(check, &QAbstractButton::toggled, check,
+      [check, enabledSetting](bool enabled) {
+        const bool saved = writeSetting(enabledSetting, enabled);
+        for (auto *other : check->window()->findChildren<QAbstractButton *>(check->objectName())) {
+          QSignalBlocker block(other);
+          other->setChecked(saved ? enabled : !enabled);
+        }
+        if (!saved)
+          QMessageBox::warning(check->window(), "无法保存快捷键", "请检查输入法配置文件的写入权限。");
+      });
+  QObject::connect(defaults, &QPushButton::clicked, editor, [editor, fallback] {
+    QList<fcitx::Key> keys;
+    for (const auto &key : fcitx::Key::keyListFromString(fallback))
+      keys.append(key.normalize());
+    editor->setKeySequence(keys);
+  });
+  QObject::connect(editor, &fcitx::FcitxQtKeySequenceWidget::keySequenceChanged,
+      editor, [editor, keySetting, fallback](const QList<fcitx::Key> &keys) {
+        fcitx::KeyList normalized;
+        for (const auto &key : keys)
+          normalized.push_back(key.normalize());
+        const auto previous = voiceShortcutKeys(keySetting, fallback);
+        const bool saved = writeSetting(keySetting, QString::fromStdString(
+            fcitx::Key::keyListToString(normalized)));
+        for (auto *other : editor->window()->findChildren<fcitx::FcitxQtKeySequenceWidget *>(editor->objectName())) {
+          if (saved && other == editor)
+            continue;
+          QSignalBlocker block(other);
+          other->setKeySequence(saved ? keys : previous);
+        }
+        if (!saved)
+          QMessageBox::warning(editor->window(), "无法保存快捷键", "请检查输入法配置文件的写入权限。");
+      });
+  return container;
+}
+class OfflineVoiceModelPanel final : public QFrame {
+  QProcess *operation_ = new QProcess(this);
+  QProcess *probe_ = new QProcess(this);
+  QLabel *status_ = new QLabel("正在检查离线模型…", this);
+  QPushButton *download_ = greenButton("下载模型");
+  QPushButton *remove_ = new QPushButton("删除模型", this);
+  QProgressBar *progress_ = new QProgressBar(this);
+  QByteArray pending_;
+  QString error_;
+  QComboBox *models_ = new QComboBox(this);
+  QLabel *description_ = new QLabel(this);
+  QString downloadDetails_;
+  QString selectedModel_;
+  bool ready_ = false;
+  bool cancelled_ = false;
+  bool acceptedDownload_ = false;
+  bool resumable_ = false;
+
+  bool message(const QString &title, const QString &text, const QString &action,
+               bool question = true) {
+    QDialog dialog(window(), Qt::Dialog | Qt::FramelessWindowHint);
+    dialog.setWindowTitle(title);
+    dialog.setObjectName("windowSurface");
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(22, 16, 22, 20);
+    layout->setSpacing(16);
+    auto *heading = new QHBoxLayout;
+    auto *label = new QLabel(title);
+    label->setObjectName("pageHeading");
+    heading->addWidget(label, 1);
+    auto *close = new SourceIconButton(asset("icon_windows_close_btn"));
+    close->setFixedSize(26, 26);
+    heading->addWidget(close);
+    QObject::connect(close, &QAbstractButton::clicked, &dialog, &QDialog::reject);
+    layout->addLayout(heading);
+    auto *body = new QLabel(text);
+    body->setWordWrap(true);
+    layout->addWidget(body);
+    auto *buttons = new QHBoxLayout;
+    buttons->addStretch();
+    if (question) {
+      auto *cancel = new QPushButton("取消");
+      cancel->setDefault(true);
+      cancel->setFocus();
+      buttons->addWidget(cancel);
+      QObject::connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    }
+    auto *confirm = greenButton(action);
+    confirm->setAutoDefault(true);
+    confirm->setDefault(!question);
+    buttons->addWidget(confirm);
+    QObject::connect(confirm, &QPushButton::clicked, &dialog, &QDialog::accept);
+    layout->addLayout(buttons);
+    const auto *screen = window()->windowHandle() ? window()->windowHandle()->screen() : QGuiApplication::primaryScreen();
+    dialog.setFixedWidth(screen ? qMin(460, qMax(240, screen->availableGeometry().width() - 24)) : 460);
+    dialog.adjustSize();
+    return dialog.exec() == QDialog::Accepted;
+  }
+
+  void refresh() {
+    if (operation_->state() == QProcess::NotRunning && probe_->state() == QProcess::NotRunning) {
+      probe_->setProperty("model", models_->currentData());
+      probe_->start(QStringLiteral(WETYPE_VOICE_TOOL), {"model", "status", "--model", models_->currentData().toString()});
+    }
+  }
+  void stop() {
+    cancelled_ = true;
+    operation_->terminate();
+    QTimer::singleShot(2500, operation_, [process = operation_] {
+      if (process->state() != QProcess::NotRunning)
+        process->kill();
+    });
+  }
+  void run(const QString &action) {
+    error_.clear(); pending_.clear(); cancelled_ = false;
+    progress_->setValue(0); progress_->setVisible(action == "install");
+    download_->setText("取消下载"); remove_->setEnabled(false);
+    status_->setText(action == "install" ? "正在连接下载，可取消后继续" : action == "verify" ? "正在校验离线模型…" : "正在删除离线模型…");
+    models_->setEnabled(false);
+    QStringList args{"model", action, "--model", models_->currentData().toString()};
+    if (action == "install")
+      args << "--accept-upstream-license";
+    operation_->start(QStringLiteral(WETYPE_VOICE_TOOL), args);
+  }
+
+public:
+  OfflineVoiceModelPanel() {
+    setObjectName("card");
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(15, 12, 15, 12);
+    auto *title = new QLabel("离线语音模型"); title->setObjectName("rowTitle");
+    layout->addWidget(title);
+    models_->setObjectName("local-voice-model-selector");
+    models_->addItem("微信输入法官方模型", "wetype");
+    models_->addItem("X-ASR · 中英实时识别", "xasr");
+    models_->addItem("Qwen3-ASR 0.6B · INT8", "qwen3");
+    models_->addItem("FireRedASR2 CTC · INT8", "firered");
+    models_->addItem("Fun-ASR-Nano · INT8", "funasr");
+    models_->setCurrentIndex(qMax(0, models_->findData(readSettings().value("local_voice_model").toString("wetype"))));
+    selectedModel_ = models_->currentData().toString();
+    layout->addWidget(models_);
+    description_->setObjectName("rowSubtitle"); description_->setWordWrap(true);
+    description_->setText("录音在本机识别，不上传；下载后可在单机模式使用。");
+    layout->addWidget(description_);
+    QObject::connect(models_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+      if (!writeSetting("local_voice_model", models_->currentData().toString())) {
+        QSignalBlocker block(models_);
+        models_->setCurrentIndex(models_->findData(selectedModel_));
+        message("无法切换模型", "请检查输入法配置文件的写入权限。", "知道了", false);
+        return;
+      }
+      selectedModel_ = models_->currentData().toString();
+      if (probe_->state() != QProcess::NotRunning) probe_->kill();
+      acceptedDownload_ = resumable_ = ready_ = false;
+      download_->setEnabled(false); remove_->setEnabled(false);
+      status_->setText("正在检查所选模型…");
+      refresh();
+    });
+    auto *actions = new QHBoxLayout;
+    status_->setObjectName("rowSubtitle"); status_->setWordWrap(true);
+    actions->addWidget(status_, 1);
+    actions->addWidget(remove_); actions->addWidget(download_);
+    download_->setObjectName("local-voice-model-download");
+    remove_->setObjectName("local-voice-model-remove");
+    remove_->setEnabled(false);
+    download_->setEnabled(false);
+    layout->addLayout(actions);
+    progress_->setTextVisible(false); progress_->setFixedHeight(4);
+    progress_->setStyleSheet("QProgressBar{border:0;background:#eee}QProgressBar::chunk{background:#13b77a}");
+    progress_->setVisible(false); layout->addWidget(progress_);
+    QObject::connect(download_, &QPushButton::clicked, this, [this] {
+      if (operation_->state() != QProcess::NotRunning) { stop(); return; }
+      if (ready_) { run("verify"); return; }
+      if (acceptedDownload_ || resumable_) { run("install"); return; }
+      if (message("下载离线语音模型",
+          downloadDetails_, "下载")) {
+        acceptedDownload_ = true; run("install");
+      }
+    });
+    QObject::connect(remove_, &QPushButton::clicked, this, [this] {
+      if (message("删除离线语音模型",
+          "将删除离线模型和未完成的下载缓存，语音设置和原版在线识别会保留。", "删除"))
+        run("remove");
+    });
+    QObject::connect(operation_, &QProcess::readyReadStandardOutput, this, [this] {
+      pending_ += operation_->readAllStandardOutput();
+      while (pending_.contains('\n')) {
+        auto index = pending_.indexOf('\n');
+        const auto value = QJsonDocument::fromJson(pending_.left(index)).object();
+        pending_.remove(0, index + 1);
+        if (value.contains("error")) error_ = value.value("error").toString();
+        if (value.value("state").toString() == "downloading") {
+          const auto total = value.value("total").toDouble();
+          const int percent = total > 0 ? qBound(0, int(100 * value.value("received").toDouble() / total), 100) : 0;
+          progress_->setValue(percent); status_->setText(QString("正在下载 · %1%").arg(percent));
+        } else if (value.value("state").toString() == "verifying") {
+          status_->setText("正在校验并准备模型…");
+        }
+      }
+      if (pending_.size() > 65536) pending_.clear();
+    });
+    QObject::connect(operation_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+        [this](int code, QProcess::ExitStatus) {
+          progress_->setVisible(false); remove_->setEnabled(false); models_->setEnabled(true);
+          if (code && !cancelled_)
+            message("离线模型未准备好", error_.isEmpty() ? "操作未完成，请检查网络、可用空间或离线模型使用状态后重试。" : error_, "知道了", false);
+          refresh();
+        });
+    QObject::connect(operation_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+      if (error == QProcess::FailedToStart) {
+        models_->setEnabled(true);
+        progress_->setVisible(false); status_->setText("无法启动语音组件，请重新安装 WeTypeX");
+        download_->setText("重试"); remove_->setEnabled(false);
+      }
+    });
+    QObject::connect(probe_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+        [this](int code, QProcess::ExitStatus) {
+          if (operation_->state() != QProcess::NotRunning) return;
+          const auto value = QJsonDocument::fromJson(probe_->readAllStandardOutput()).object();
+          if (probe_->property("model") != models_->currentData()) { refresh(); return; }
+          ready_ = !code && value.value("ready").toBool();
+          const bool supported = !code && value.value("supported").toBool();
+          resumable_ = value.value("downloaded_bytes").toDouble() > 0;
+          const bool present = value.value("present").toBool();
+          download_->setEnabled(supported); download_->setText(ready_ ? "校验模型" : resumable_ ? "继续下载" : present ? "修复模型" : "下载模型");
+          remove_->setText(present ? "删除模型" : "清除下载");
+          remove_->setEnabled(value.value("removable").toBool());
+          const auto mb = [](double bytes) { return QString::number(bytes / 1000000., 'f', 0) + " MB"; };
+          const auto size = mb(value.value("size").toDouble());
+          const auto installed = mb(value.value("model_bytes").toDouble());
+          const auto runtime = value.value("runtime_size").toDouble();
+          description_->setText(value.value("description").toString() + " 录音不上传，可在单机模式使用。");
+          downloadDetails_ = QString("模型下载约 %1，安装后约 %2。许可：%3。来源：%4。")
+              .arg(size, installed, value.value("license").toString(), value.value("source").toString());
+          if (runtime > 0)
+            downloadDetails_ += QString("首次另需下载约 %1 共享运行组件，其他可选模型会复用。").arg(mb(runtime));
+          status_->setText(!supported ? "当前平台或安装缺少离线组件，请检查安装" :
+                           ready_ ? "已下载 · 约 " + installed :
+                           resumable_ ? "下载未完成，可继续下载" : present ? "模型需要修复，可重新下载" : "未下载 · 约 " + size);
+        });
+    QObject::connect(probe_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+      if (error == QProcess::FailedToStart) {
+        status_->setText("无法启动语音组件，请重新安装 WeTypeX"); download_->setEnabled(false); remove_->setEnabled(false);
+      }
+    });
+    auto *timer = new QTimer(this); timer->setInterval(3000);
+    QObject::connect(timer, &QTimer::timeout, this, [this] { if (isVisible()) refresh(); });
+    timer->start();
+    QObject::connect(qApp, &QCoreApplication::aboutToQuit, this, [this] {
+      if (probe_->state() != QProcess::NotRunning) { probe_->kill(); probe_->waitForFinished(300); }
+      if (operation_->state() != QProcess::NotRunning) {
+        stop();
+        if (!operation_->waitForFinished(700)) operation_->kill();
+      }
+    });
+  }
+  QComboBox *modelSelector() const { return models_; }
+  void setLocal(bool value) {
+    if (!value && operation_->state() != QProcess::NotRunning) stop();
+    setVisible(value);
+    if (value) refresh();
+  }
+};
+static bool applyClassicTheme(int mode, std::optional<int> size,
+                              bool themeChanged, QLabel *status) {
   QString path = configDir() + "/conf/classicui.conf";
   QString backup = configDir() + "/wetype-appearance-backup.json";
   QFile file(path);
   QString text;
-  if (file.open(QIODevice::ReadOnly))
+  if (file.open(QIODevice::ReadOnly)) {
     text = QString::fromUtf8(file.readAll());
+  } else if (file.exists()) {
+    status->setText("无法读取外观配置，未更改字体");
+    return false;
+  }
   if (!QFile::exists(backup)) {
     QJsonObject object;
     object["existed"] = QFile::exists(path);
     object["content"] = text;
     if (!writeFile(backup, QJsonDocument(object).toJson())) {
       status->setText("无法备份原主题，未更改配置");
-      return;
+      return false;
     }
   }
-  setIni(text, "Theme", mode == 2 ? "wetypex-dark" : "wetypex-light");
-  setIni(text, "DarkTheme", "wetypex-dark");
-  setIni(text, "UseDarkTheme", mode == 0 ? "True" : "False");
-  setIni(text, "UseAccentColor", "False");
-  setIni(text, "PreferTextIcon", "False");
-  setIni(text, "Font", "Noto Sans CJK SC " + QString::number(size));
+  std::map<std::string, std::string> values;
+  if (themeChanged) {
+    values = {{"Theme", mode == 2 ? "wetypex-dark" : "wetypex-light"},
+              {"DarkTheme", "wetypex-dark"},
+              {"UseDarkTheme", mode == 0 ? "True" : "False"},
+              {"UseAccentColor", "False"},
+              {"PreferTextIcon", "False"}};
+  }
+  if (size)
+    values["Font"] = wetype::candidateFontWithSize(
+        wetype::classicUiValue(text.toStdString(), "Font").value_or(""), *size);
+  text = QString::fromStdString(
+      wetype::updateClassicUi(text.toStdString(), values));
   if (!writeFile(path, text.toUtf8())) {
     status->setText("保存外观失败");
-    return;
+    return false;
   }
   QDBusInterface controller("org.fcitx.Fcitx5", "/controller",
                             "org.fcitx.Fcitx.Controller1");
@@ -589,6 +989,7 @@ static void applyClassicTheme(int mode, int size, QLabel *status) {
   status->setText(reply.type() == QDBusMessage::ErrorMessage
                       ? "配置已保存，Fcitx5 下次启动时生效"
                       : "外观已应用");
+  return true;
 }
 
 using ToggleSpec = std::tuple<QString, QString, bool>;
@@ -703,6 +1104,7 @@ int main(int argc, char **argv) {
     QCheckBox::indicator:checked { background:#23c891; border:1px solid #23c891; border-radius:3px; }
     QCheckBox::indicator:unchecked { background:white; border:1px solid #cfd1d2; border-radius:3px; }
     QComboBox,QSpinBox { min-height:25px; padding:0 8px; border:0; background:transparent; color:#777; }
+    QComboBox QAbstractItemView { background:#fff; color:#202124; }
     QPushButton { min-height:26px; padding:0 14px; background:white; border:1px solid #d9d9d9; border-radius:4px; }
     QPushButton:hover { border-color:#23c891; }
     QPushButton#greenButton { color:white; background:#23c891; border-color:#23c891; min-height:28px; }
@@ -874,10 +1276,29 @@ int main(int argc, char **argv) {
                      {"an/ai", "fuzzy_an_ai", false},
                      {"eng/ong", "fuzzy_eng_ong", false}});
   });
+  auto *chinesePunctuation =
+      toggle(wetype::settingBool(settings.value("chinese_punctuation"), true),
+             true, "chinese_punctuation");
+  auto *rememberPunctuation =
+      toggle(wetype::settingBool(settings.value("remember_punctuation"), false),
+             true, "remember_punctuation");
+  QObject::connect(&app, &QGuiApplication::applicationStateChanged, input.widget,
+                   [=](Qt::ApplicationState state) {
+                     if (state != Qt::ApplicationActive)
+                       return;
+                     const auto latest = readSettings();
+                     const QSignalBlocker chineseBlock(chinesePunctuation);
+                     const QSignalBlocker rememberBlock(rememberPunctuation);
+                     chinesePunctuation->setChecked(wetype::settingBool(
+                         latest.value("chinese_punctuation"), true));
+                     rememberPunctuation->setChecked(wetype::settingBool(
+                         latest.value("remember_punctuation"), false));
+                   });
   input.body->addWidget(rowsCard(
-      {row("中文模式默认使用中文标点", "关闭后默认使用 , . ! ? 等英文标点；Ctrl + . 可临时切换，独立于全半角",
-           toggle(wetype::settingBool(settings.value("chinese_punctuation"), true),
-                  true, "chinese_punctuation")),
+      {row("中文模式默认使用中文标点", "关闭后默认使用 , . ! ? 等英文标点，独立于全半角",
+           chinesePunctuation),
+       row("记住中英文标点切换", "开启后，Ctrl + . 的选择成为默认偏好，切换输入框或重启后仍保留",
+           rememberPunctuation),
        row("输入中文时，将「/?」按键替换为 、", {},
            toggle(
                wetype::settingBool(settings.value("slash_punctuation"), true),
@@ -921,32 +1342,38 @@ int main(int argc, char **argv) {
       {"icon_speech", "语音实时转写到输入框，表达又快又准"},
       {"icon_time", "连续输入不限时长，超长内容轻松记"},
       {"icon_many", "支持中文、英文及多种方言自由混说"}};
+  QList<QLabel *> voiceFeatureLabels;
+  QWidget *voiceLanguageArrow = nullptr;
   for (const auto &[icon, text] : voiceFeatures) {
     auto *feature = new QWidget;
     auto *layout = new QHBoxLayout(feature);
     layout->setContentsMargins(4, 1, 4, 1);
     layout->setSpacing(10);
     layout->addWidget(iconLabel(icon, 18));
-    layout->addWidget(new QLabel(text), 1);
-    if (icon == "icon_many")
-      layout->addWidget(iconLabel("icon_about_arrow", 14));
+    auto *label = new QLabel(text);
+    label->setWordWrap(true);
+    voiceFeatureLabels.append(label);
+    layout->addWidget(label, 1);
+    if (icon == "icon_many") {
+      voiceLanguageArrow = iconLabel("icon_about_arrow", 14);
+      layout->addWidget(voiceLanguageArrow);
+    }
     voiceHeroLayout->addWidget(feature);
   }
   voice.body->addWidget(voiceHero);
   voice.body->addWidget(rowsCard(
-      {row("快捷键", {}, nullptr, 44),
-       shortcutRow(
-           "启动语音输入",
-           wetype::settingBool(settings.value("voice_launch_shortcut"), true),
-           {"Ctrl", "Win", "Shift", "×"},
-           "按下启动或结束；空格结束，回车上屏，Esc 取消", true,
-           "voice_launch_shortcut"),
-       shortcutRow(
-           "按住说话",
-           wetype::settingBool(settings.value("voice_hold_shortcut"), true),
-           {"Ctrl", "Win", "×"}, "按住可语音输入，松手结束", true,
-           "voice_hold_shortcut")}));
+      {row("快捷键", "在其他应用的文本框中使用；点击按键可修改", nullptr, 62),
+       voiceShortcutRow("启动语音输入",
+                        "按下启动或结束；\n空格结束，回车上屏，Esc 取消",
+                        "voice_launch_shortcut", "voice_launch_key",
+                        "Control+Super+Shift_L"),
+       voiceShortcutRow("按住说话", "按住可语音输入，松手结束",
+                        "voice_hold_shortcut", "voice_hold_key",
+                        "Control+Super_L")}));
   auto *microphone = new QComboBox;
+  microphone->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+  microphone->setMinimumContentsLength(12);
+  microphone->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
   microphone->addItem("自动检测");
   QProcess pipewire;
   pipewire.start(QStringLiteral("pw-dump"), QStringList{});
@@ -1012,6 +1439,9 @@ int main(int argc, char **argv) {
     }
     microphone->setCurrentIndex(index);
   }
+  microphone->setToolTip(microphone->currentText());
+  QObject::connect(microphone, &QComboBox::currentTextChanged,
+                   microphone, &QWidget::setToolTip);
   QObject::connect(
       microphone, qOverload<int>(&QComboBox::currentIndexChanged), [microphone](int index) {
         writeSetting("voice_microphone",
@@ -1029,6 +1459,36 @@ int main(int argc, char **argv) {
   QObject::connect(
       punctuationMode, &QComboBox::currentTextChanged,
       [](const QString &value) { writeSetting("voice_punctuation", value); });
+  auto *provider = new QComboBox;
+  provider->setObjectName("voice-provider");
+  provider->addItems({"原版在线", "本地离线"});
+  provider->setCurrentIndex(settings.value("voice_provider").toString() == "local" ? 1 : 0);
+  auto *voiceLocalModel = new OfflineVoiceModelPanel;
+  auto *polishToggle = toggle(wetype::settingBool(settings.value("voice_smart_polish"), true), true, "voice_smart_polish");
+  auto updateProvider = [=](int index) {
+    voiceLocalModel->setLocal(index == 1);
+    polishToggle->setEnabled(index == 0);
+    polishToggle->setToolTip(index == 1 ? "智能整理需要联网，仅在原版在线识别时使用" : "");
+    const auto model = voiceLocalModel->modelSelector()->currentData().toString();
+    const bool streaming = model == "wetype" || model == "xasr";
+    const QStringList localFeatures{streaming ? "边说边出字，在本机完成识别" : "停顿后分段出字，在本机完成识别",
+                                   "单次最长十分钟，空格结束、回车确认", "语言范围见所选模型，录音不上传"};
+    for (int i = 0; i < voiceFeatureLabels.size(); ++i)
+      voiceFeatureLabels[i]->setText(index == 1 ? localFeatures[i] : voiceFeatures[i].second);
+    if (voiceLanguageArrow) voiceLanguageArrow->setVisible(index == 0);
+  };
+  updateProvider(provider->currentIndex());
+  QObject::connect(voiceLocalModel->modelSelector(), qOverload<int>(&QComboBox::currentIndexChanged), [=] {
+    updateProvider(provider->currentIndex());
+  });
+  QObject::connect(provider, qOverload<int>(&QComboBox::currentIndexChanged), [=](int index) {
+    if (!writeSetting("voice_provider", index == 1 ? "local" : "original")) {
+      QSignalBlocker block(provider); provider->setCurrentIndex(1 - index);
+    }
+    updateProvider(provider->currentIndex());
+  });
+  voice.body->addWidget(rowsCard({row("识别方式", {}, provider, 48)}));
+  voice.body->addWidget(voiceLocalModel);
   voice.body->addWidget(
       rowsCard({row("麦克风", "设置语音输入的默认麦克风", microphone),
                 row("标点设置", {}, punctuationMode),
@@ -1038,11 +1498,9 @@ int main(int argc, char **argv) {
                                settings.value("voice_copy_to_clipboard"), true),
                            true, "voice_copy_to_clipboard"),
                     74),
-                row("语音智能整理", {},
-                    toggle(wetype::settingBool(
-                               settings.value("voice_smart_polish"), true),
-                           true, "voice_smart_polish"),
-                    52)}));
+                row("语音智能整理", "仅原版在线识别可用",
+                    polishToggle,
+                    64)}));
   pages->addWidget(voice.widget);
 
   auto phrases = page("", false);
@@ -1170,7 +1628,19 @@ int main(int argc, char **argv) {
   visual.body->addWidget(preview);
   auto *candidateSize = new QSlider(Qt::Horizontal);
   candidateSize->setRange(10, 18);
-  candidateSize->setValue(settings.value("candidate_size").toInt(13));
+  const auto fontDescription =
+      appearance.value("Font")
+          .section(QRegularExpression(QStringLiteral("[ \t]+[@#]")), 0, 0)
+          .trimmed();
+  const auto fontSizeMatch =
+      QRegularExpression(
+          QStringLiteral("(?:^|[ \t])([0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:px)?$"))
+          .match(fontDescription);
+  bool fontSizeValid = false;
+  const auto fontSize = fontSizeMatch.captured(1).toDouble(&fontSizeValid);
+  candidateSize->setValue(fontSizeValid
+                              ? qRound(std::clamp(fontSize, 10.0, 18.0))
+                              : settings.value("candidate_size").toInt(13));
   auto *sliderBox = new QWidget;
   sliderBox->setFixedHeight(120);
   auto *sliderLayout = new QVBoxLayout(sliderBox);
@@ -1214,16 +1684,32 @@ int main(int argc, char **argv) {
   visual.body->addWidget(
       rowsCard({row("候选序号样式", "微信风格：1输入；Fcitx 默认：1. 输入",
                     labelStyle, 64)}));
+  auto *pageSize = new QSpinBox;
+  pageSize->setRange(3, 9);
+  pageSize->setValue(settings.value("page_size").toInt(5));
+  visual.body->addWidget(rowsCard(
+      {row("每页候选数", "默认 5 项，可设置为 3–9 项", pageSize, 64)}));
   auto updatePreview = [=] {
-    preview->setText(
-        labelStyle->currentIndex() == 1
-            ? "<span style='background:#13b77a;color:white;padding:5px'>1. "
-              "输入</span>　2. 输入法　3. 诗心　4. 为新　5. 唯心"
-            : "<span "
-              "style='background:#13b77a;color:white;padding:5px'>1输入</"
-              "span>　2输入法　3诗心　4为新　5唯心");
+    const QStringList words{"输入", "输入法", "诗心", "为新", "唯心",
+                            "维新", "威信", "微新", "惟心"};
+    QStringList candidates;
+    for (int i = 0; i < pageSize->value(); ++i) {
+      auto text = QString::number(i + 1) +
+                  (labelStyle->currentIndex() == 1 ? ". " : "") + words[i];
+      if (!i)
+        text = "<span style='background:#13b77a;color:white;padding:5px'>" +
+               text + "</span>";
+      candidates.append(text);
+    }
+    preview->setText(candidates.join(QStringLiteral("　")));
   };
+  preview->setWordWrap(true);
   updatePreview();
+  QObject::connect(pageSize, qOverload<int>(&QSpinBox::valueChanged),
+                   [=](int value) {
+                     writeSetting("page_size", value);
+                     updatePreview();
+                   });
   QObject::connect(labelStyle, qOverload<int>(&QComboBox::currentIndexChanged),
                    [=](int index) {
                      writeSetting("candidate_label_style",
@@ -1234,15 +1720,26 @@ int main(int argc, char **argv) {
   auto *appearanceStatus = new QLabel;
   appearanceStatus->setObjectName("rowSubtitle");
   visual.body->addWidget(appearanceStatus);
-  auto applyVisual = [=] {
-    writeSetting("candidate_size", candidateSize->value());
-    writeSetting("theme_mode", theme->currentIndex());
-    applyClassicTheme(theme->currentIndex(), candidateSize->value(),
-                      appearanceStatus);
+  auto appliedSize = std::make_shared<int>(candidateSize->value());
+  auto applySize = [=] {
+    if (candidateSize->value() == *appliedSize)
+      return;
+    if (applyClassicTheme(theme->currentIndex(), candidateSize->value(), false,
+                          appearanceStatus)) {
+      *appliedSize = candidateSize->value();
+      writeSetting("candidate_size", candidateSize->value());
+    }
   };
-  QObject::connect(candidateSize, &QSlider::sliderReleased, applyVisual);
-  QObject::connect(theme, qOverload<int>(&QComboBox::currentIndexChanged),
-                   [=](int) { applyVisual(); });
+  QObject::connect(candidateSize, &QSlider::sliderReleased, applySize);
+  QObject::connect(candidateSize, &QSlider::valueChanged, [=](int) {
+    if (!candidateSize->isSliderDown())
+      applySize();
+  });
+  QObject::connect(
+      theme, qOverload<int>(&QComboBox::currentIndexChanged), [=](int index) {
+        if (applyClassicTheme(index, std::nullopt, true, appearanceStatus))
+          writeSetting("theme_mode", index);
+      });
   pages->addWidget(visual.widget);
 
   auto shortcuts = page("快捷键");
@@ -1280,24 +1777,20 @@ int main(int argc, char **argv) {
                              : "使用已配置的按键直接打开，仅在中文全拼中生效",
                    true, "v_mode")}));
   shortcuts.body->addWidget(rowsCard(
-      {row("语音输入", {}, nullptr, 44),
-       shortcutRow(
-           "启动语音输入",
-           wetype::settingBool(settings.value("voice_launch_shortcut"), true),
-           {"Ctrl", "Win", "Shift", "×"},
-           "按下启动或结束；空格结束，回车上屏，Esc 取消", true,
-           "voice_launch_shortcut"),
-       shortcutRow(
-           "按住说话",
-           wetype::settingBool(settings.value("voice_hold_shortcut"), true),
-           {"Ctrl", "Win", "×"}, "按住可语音输入，松手结束", true,
-           "voice_hold_shortcut")}));
+      {row("语音输入", "在其他应用的文本框中使用；点击按键可修改", nullptr, 62),
+       voiceShortcutRow("启动语音输入",
+                        "按下启动或结束；\n空格结束，回车上屏，Esc 取消",
+                        "voice_launch_shortcut", "voice_launch_key",
+                        "Control+Super+Shift_L"),
+       voiceShortcutRow("按住说话", "按住可语音输入，松手结束",
+                        "voice_hold_shortcut", "voice_hold_key",
+                        "Control+Super_L")}));
   shortcuts.body->addWidget(rowsCard(
       {row("输入状态切换", {}, nullptr, 44),
        shortcutRow(
            "全半角输入切换",
            wetype::settingBool(settings.value("half_full_switch"), false),
-           {"shift", "backslash-icon"}, {}, true, "half_full_switch"),
+           configuredKeyCaps("half_full_keys", "Shift+space"), {}, true, "half_full_switch"),
        shortcutRow(
            "中文下中英标点切换",
            wetype::settingBool(settings.value("punctuation_switch"), true),

@@ -3,15 +3,14 @@
 #define _GNU_SOURCE 1
 #include "../common/json.hpp"
 #include <algorithm>
-#include <array>
 #include <arpa/inet.h>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
-#include <cstdarg>
 #include <condition_variable>
-#include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -33,8 +32,8 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <set>
 #include <setjmp.h>
 #include <signal.h>
@@ -50,6 +49,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -70,57 +70,212 @@ static std::vector<DarwinTLSImage> tls_images;
 static std::string active_libcxx_path = "libc++.so.1";
 static uintptr_t stack_guard = 0xa35197bd82e436c1ULL;
 static bool service_mode = false;
-static bool original_cpu_supported() {
+static std::string workspace_root = "/work";
+static std::string user_dictionary_path = "/work/userDict";
+
+// Darwin sigset_t is four bytes. Passing it directly to Linux sigprocmask
+// overwrites the caller's adjacent stack data, including the previous SIGILL
+// handler saved by CryptoPP's CPU probe. Darwin also numbers both signals and
+// SIG_BLOCK/UNBLOCK/SETMASK differently from Linux.
+static constexpr std::array<int, 32> darwin_signals = {
+    0,       SIGHUP,  SIGINT,    SIGQUIT, SIGILL,   SIGTRAP, SIGABRT, 0,
+    SIGFPE,  SIGKILL, SIGBUS,    SIGSEGV, SIGSYS,   SIGPIPE, SIGALRM, SIGTERM,
+    SIGURG,  SIGSTOP, SIGTSTP,   SIGCONT, SIGCHLD,  SIGTTIN, SIGTTOU, SIGIO,
+    SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, 0,       SIGUSR1, SIGUSR2};
+
+static sigset_t native_signal_mask(uint32_t mask) {
+  sigset_t result;
+  sigemptyset(&result);
+  for (unsigned signal = 1; signal < darwin_signals.size(); ++signal)
+    if ((mask & (uint32_t{1} << (signal - 1))) && darwin_signals[signal])
+      sigaddset(&result, darwin_signals[signal]);
+  return result;
+}
+
+static uint32_t darwin_signal_mask(const sigset_t &mask) {
+  uint32_t result = 0;
+  for (unsigned signal = 1; signal < darwin_signals.size(); ++signal)
+    if (darwin_signals[signal] &&
+        sigismember(&mask, darwin_signals[signal]) == 1)
+      result |= uint32_t{1} << (signal - 1);
+  return result;
+}
+
+static int change_signal_mask(int how, const uint32_t *mask, uint32_t *previous,
+                              bool thread) {
+  int operation = SIG_SETMASK;
+  if (mask) {
+    switch (how) {
+    case 1:
+      operation = SIG_BLOCK;
+      break;
+    case 2:
+      operation = SIG_UNBLOCK;
+      break;
+    case 3:
+      operation = SIG_SETMASK;
+      break;
+    default:
+      if (!thread)
+        errno = EINVAL;
+      return thread ? EINVAL : -1;
+    }
+  }
+  const sigset_t native = native_signal_mask(mask ? *mask : 0);
+  sigset_t old;
+  int result = thread ? pthread_sigmask(operation, mask ? &native : nullptr,
+                                        previous ? &old : nullptr)
+                      : sigprocmask(operation, mask ? &native : nullptr,
+                                    previous ? &old : nullptr);
+  if (!result && previous)
+    *previous = darwin_signal_mask(old);
+  return result;
+}
+
+extern "C" int shim_sigprocmask(int how, const uint32_t *mask,
+                                uint32_t *previous) {
+  return change_signal_mask(how, mask, previous, false);
+}
+
+extern "C" int shim_pthread_sigmask(int how, const uint32_t *mask,
+                                    uint32_t *previous) {
+  return change_signal_mask(how, mask, previous, true);
+}
+
+static void crash(int sig, siginfo_t *info, void *ctx);
+extern "C" auto shim_signal(int number, void (*handler)(int)) -> void (*)(int) {
+  // CryptoPP restores the handler returned by signal(). Our handler needs the
+  // siginfo/ucontext arguments, so restoring it must also restore SA_SIGINFO.
+  if (handler != reinterpret_cast<void (*)(int)>(crash))
+    return signal(number, handler);
+  struct sigaction action{}, previous{};
+  action.sa_sigaction = crash;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(number, &action, &previous))
+    return SIG_ERR;
+  return previous.sa_handler;
+}
+
+static bool original_cpu_supported(bool voice = false) {
 #if defined(__aarch64__)
+  (void)voice;
   // The macOS ARM64 image targets Apple Silicon. Older Linux ARM64 CPUs
   // execute that same ARM64 image through qemu-user, without ABI substitution.
-  constexpr unsigned long required = HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL |
-      HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_CRC32 | HWCAP_ATOMICS | HWCAP_FPHP |
-      HWCAP_ASIMDHP | HWCAP_LRCPC | HWCAP_ASIMDDP;
+  constexpr unsigned long required =
+      HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL | HWCAP_SHA1 | HWCAP_SHA2 |
+      HWCAP_CRC32 | HWCAP_ATOMICS | HWCAP_FPHP | HWCAP_ASIMDHP | HWCAP_LRCPC |
+      HWCAP_ASIMDDP;
   return (getauxval(AT_HWCAP) & required) == required;
+#elif defined(__x86_64__)
+  // Both supported x86 images use AVX2 in their software AES table setup.
+  // An AVX-capable CPU with AES-NI takes the hardware path instead; do not
+  // force those older processors into emulation merely for lacking AVX2.
+  __builtin_cpu_init();
+  if (!__builtin_cpu_supports("avx"))
+    return false;
+  if (voice)
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+  return __builtin_cpu_supports("aes") || __builtin_cpu_supports("avx2");
 #else
-  return true;
+  return false;
 #endif
 }
-static bool select_execution_provider(int argc, char **argv) {
+#ifndef WETYPE_QEMU_AARCH64
+#define WETYPE_QEMU_AARCH64 "/usr/bin/qemu-aarch64"
+#endif
+#ifndef WETYPE_QEMU_X86_64
+#define WETYPE_QEMU_X86_64 "/usr/bin/qemu-x86_64"
+#endif
 #if defined(__aarch64__)
+static constexpr const char *execution_architecture = "aarch64";
+static constexpr const char *configured_qemu = WETYPE_QEMU_AARCH64;
+static constexpr const char *static_qemu = "/usr/bin/qemu-aarch64-static";
+#else
+static constexpr const char *execution_architecture = "x86_64";
+static constexpr const char *configured_qemu = WETYPE_QEMU_X86_64;
+static constexpr const char *static_qemu = "/usr/bin/qemu-x86_64-static";
+#endif
+static std::string compatibility_executable() {
+  for (const auto *path : {configured_qemu, static_qemu})
+    if (access(path, X_OK) == 0)
+      return path;
+  return {};
+}
+static std::string host_executable;
+static bool compatibility_ready(const std::string &executable) {
+  if (executable.empty())
+    return false;
+  const pid_t child = fork();
+  if (child < 0)
+    return false;
+  if (!child) {
+    alarm(5);
+    const int sink = open("/dev/null", O_RDWR);
+    if (sink >= 0) {
+      for (int fd = 0; fd <= 2; ++fd)
+        dup2(sink, fd);
+      if (sink > 2)
+        close(sink);
+    }
+    const char *arguments[] = {
+        executable.c_str(), "-cpu",      "max",  host_executable.c_str(),
+        "voice",           "cpu-check", nullptr};
+    execv(executable.c_str(), const_cast<char *const *>(arguments));
+    _exit(126);
+  }
+  int status = 0;
+  while (waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR)
+      return false;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+static bool select_execution_provider(int argc, char **argv) {
   const char *choice = getenv("WETYPE_ENGINE_PROVIDER");
   const std::string provider = choice && *choice ? choice : "auto";
   if (provider != "auto" && provider != "native" && provider != "qemu") {
     fputs("invalid original-engine execution provider\n", stderr);
     return false;
   }
-  if (getenv("WETYPE_QEMU_WRAPPED") || provider == "native" ||
-      (provider == "auto" && original_cpu_supported()) ||
+  const bool voice =
+      !strcmp(argv[2], "voice-service") ||
+      (!strcmp(argv[2], "business-service") &&
+       (getenv("WETYPE_VOICE_STREAM") || getenv("WETYPE_VOICE_FILE")));
+  if (getenv("WETYPE_QEMU_WRAPPED")) {
+    if (!original_cpu_supported(voice) && strcmp(argv[2], "network-info")) {
+      fputs("the compatibility provider lacks required CPU instructions; "
+            "update qemu-user\n",
+            stderr);
+      return false;
+    }
+    return true;
+  }
+  if (provider == "native" ||
+      (provider == "auto" && original_cpu_supported(voice)) ||
       !strcmp(argv[2], "network-info"))
     return true;
-  std::string executable;
-#ifndef WETYPE_QEMU_AARCH64
-#define WETYPE_QEMU_AARCH64 "/usr/bin/qemu-aarch64"
-#endif
-  for (const auto *path : {WETYPE_QEMU_AARCH64, "/usr/bin/qemu-aarch64-static"})
-    if (access(path, X_OK) == 0) {
-      executable = path;
-      break;
-    }
+  auto executable = compatibility_executable();
   if (executable.empty()) {
-    fputs("this ARM64 processor needs the distribution qemu-user package\n", stderr);
+    fprintf(stderr, "this %s processor needs qemu-user (qemu-%s)\n",
+            execution_architecture, execution_architecture);
+    return false;
+  }
+  if (!compatibility_ready(executable)) {
+    fputs("the compatibility provider lacks required CPU instructions; update "
+          "qemu-user\n",
+          stderr);
     return false;
   }
   setenv("WETYPE_QEMU_WRAPPED", "1", 1);
   std::vector<char *> arguments{executable.data(), const_cast<char *>("-cpu"),
-      const_cast<char *>("max")};
+                                const_cast<char *>("max")};
   for (int i = 0; i < argc; ++i)
     arguments.push_back(argv[i]);
   arguments.push_back(nullptr);
   execv(executable.c_str(), arguments.data());
-  perror("start ARM64 compatibility provider");
+  perror("start original-engine compatibility provider");
   return false;
-#else
-  (void)argc;
-  (void)argv;
-  return true;
-#endif
 }
 static std::string upstream_app_version = "2.2.3(657)";
 static std::mutex userDataMutex;
@@ -2063,7 +2218,8 @@ static void show_address(uintptr_t pc) {
 static void crash(int sig, siginfo_t *info, void *ctx) {
   auto uc = (ucontext_t *)ctx;
 #if defined(__x86_64__)
-  fprintf(stderr, "FAULT signal=%d address=%p rip=", sig, info->si_addr);
+  fprintf(stderr, "FAULT signal=%d code=%d address=%p rip=", sig, info->si_code,
+          info->si_addr);
   show_address(uc->uc_mcontext.gregs[REG_RIP]);
   fprintf(stderr, "REG rdi=%llx rsi=%llx rdx=%llx rax=%llx rbp=%llx rsp=%llx\n",
           (long long)uc->uc_mcontext.gregs[REG_RDI],
@@ -2074,7 +2230,8 @@ static void crash(int sig, siginfo_t *info, void *ctx) {
           (long long)uc->uc_mcontext.gregs[REG_RSP]);
   auto sp = (uintptr_t *)uc->uc_mcontext.gregs[REG_RSP];
 #elif defined(__aarch64__)
-  fprintf(stderr, "FAULT signal=%d address=%p pc=", sig, info->si_addr);
+  fprintf(stderr, "FAULT signal=%d code=%d address=%p pc=", sig, info->si_code,
+          info->si_addr);
   show_address(uc->uc_mcontext.pc);
   fprintf(stderr, "REG x0=%llx x1=%llx x2=%llx x3=%llx x8=%llx x16=%llx x17=%llx fp=%llx sp=%llx lr=",
           (long long)uc->uc_mcontext.regs[0], (long long)uc->uc_mcontext.regs[1],
@@ -3049,7 +3206,10 @@ static void *resolve(const std::string &name) {
       {"_recvmsg", (void *)shim_recvmsg},
       {"_select$1050", (void *)select},
       {"_select$DARWIN_EXTSN", (void *)select},
+      {"_signal", (void *)shim_signal},
       {"_sigsetjmp", (void *)__sigsetjmp},
+      {"_sigprocmask", (void *)shim_sigprocmask},
+      {"_pthread_sigmask", (void *)shim_pthread_sigmask},
       {"_setsockopt", (void *)shim_setsockopt},
       {"_send", (void *)shim_send},
       {"_sendmsg", (void *)shim_sendmsg},
@@ -3183,7 +3343,7 @@ static bool configure_wubi_dictionary(unsigned solution) {
     return true;
   auto &dicts = dictionarySets[solution];
   NativeDictConfig config{dicts.data(), uint32_t(dicts.size()), 0,
-                          "/work/userDict"};
+                          user_dictionary_path.c_str()};
   const bool loaded =
       ((bool (*)(const NativeDictConfig *))syms.at("_wxime_config_dict"))(&config);
   if (loaded)
@@ -3428,6 +3588,25 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: host PREPARED_DIR MODE [ASCII_PINYIN]\n");
     return 2;
   }
+  host_executable = argv[0];
+  if (!host_executable.empty() && host_executable.front() != '/') {
+    char path[4096];
+    const auto length = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (length > 0)
+      host_executable.assign(path, length);
+  }
+  if (!strcmp(argv[2], "cpu-check"))
+    return original_cpu_supported(!strcmp(argv[1], "voice")) ? 0 : 78;
+  if (const char *workspace = getenv("WETYPE_WORKSPACE")) {
+    std::error_code error;
+    const auto path = std::filesystem::canonical(workspace, error);
+    if (error || !path.is_absolute() || chdir(path.c_str())) {
+      fputs("unable to enter the engine workspace\n", stderr);
+      return 2;
+    }
+    workspace_root = path.string();
+    user_dictionary_path = workspace_root + "/userDict";
+  }
   const bool mappingOnly = !strcmp(argv[2], "version") ||
                            !strcmp(argv[2], "module-map");
   if (!select_execution_provider(argc, argv))
@@ -3507,18 +3686,31 @@ int main(int argc, char **argv) {
     wire::boolean(report.get(), "ws", flags & 1);
     wire::boolean(report.get(), "wss", flags & 2);
     wire::boolean(report.get(), "ipv6", flags & 4);
-    wire::boolean(report.get(), "native_cpu_supported", original_cpu_supported());
+    const bool nativeInput = original_cpu_supported();
+    const bool nativeVoice = original_cpu_supported(true);
+    wire::boolean(report.get(), "native_cpu_supported", nativeInput);
+    wire::boolean(report.get(), "native_voice_cpu_supported", nativeVoice);
     const char *configuredProvider = getenv("WETYPE_ENGINE_PROVIDER");
-    const bool qemuProvider = getenv("WETYPE_QEMU_WRAPPED") ||
-        (configuredProvider && !strcmp(configuredProvider, "qemu")) ||
-        ((!configuredProvider || !strcmp(configuredProvider, "auto")) && !original_cpu_supported());
-    wire::put(report.get(), "execution_provider", std::string(qemuProvider ? "qemu" : "native"));
-    bool executionReady = true;
-#if defined(__aarch64__)
-    executionReady = !qemuProvider || access(WETYPE_QEMU_AARCH64, X_OK) == 0 ||
-        access("/usr/bin/qemu-aarch64-static", X_OK) == 0;
-#endif
-    wire::boolean(report.get(), "execution_ready", executionReady);
+    const std::string selection =
+        configuredProvider && *configuredProvider ? configuredProvider : "auto";
+    const bool wrapped = getenv("WETYPE_QEMU_WRAPPED");
+    const bool forceQemu = wrapped || selection == "qemu";
+    const bool qemuInput = forceQemu || (selection == "auto" && !nativeInput);
+    const bool qemuVoice = forceQemu || (selection == "auto" && !nativeVoice);
+    const bool emulatorReady =
+        wrapped ? nativeInput && nativeVoice
+                : ((qemuInput || qemuVoice) &&
+                   compatibility_ready(compatibility_executable()));
+    wire::put(report.get(), "execution_provider",
+              std::string(qemuInput ? "qemu" : "native"));
+    wire::put(report.get(), "voice_execution_provider",
+              std::string(qemuVoice ? "qemu" : "native"));
+    wire::put(report.get(), "architecture",
+              std::string(execution_architecture));
+    wire::boolean(report.get(), "execution_ready",
+                  qemuInput ? emulatorReady : nativeInput);
+    wire::boolean(report.get(), "voice_execution_ready",
+                  qemuVoice ? emulatorReady : nativeVoice);
     wire::put(report.get(), "address_policy",
               std::string("happy-eyeballs-200ms-with-ipv4-retry"));
     puts(wire::dump(report.get()).c_str());
@@ -3534,7 +3726,8 @@ int main(int argc, char **argv) {
     const auto version = wire::str(document.get(), "version");
     const auto build = version.rfind('.');
     if (metadata.size() > 16384 || version.empty() || version.size() > 64 ||
-        build == std::string::npos || build == 0 || build + 1 == version.size() ||
+        build == std::string::npos || build == 0 ||
+        build + 1 == version.size() ||
         std::count(version.begin(), version.end(), '.') != 3 ||
         version.find("..") != std::string::npos || version.front() == '.' ||
         !std::all_of(version.begin(), version.end(), [](char c) {
@@ -3543,8 +3736,8 @@ int main(int argc, char **argv) {
       fputs("invalid upstream runtime version metadata\n", stderr);
       return 2;
     }
-    upstream_app_version = version.substr(0, build) + "(" +
-                           version.substr(build + 1) + ")";
+    upstream_app_version =
+        version.substr(0, build) + "(" + version.substr(build + 1) + ")";
   }
   std::vector<std::string> binds, unwinds;
   std::vector<std::pair<uintptr_t, std::string>> ctors;
@@ -3584,7 +3777,10 @@ int main(int argc, char **argv) {
     const size_t page = size_t(sysconf(_SC_PAGESIZE));
     bool copiedImage = false;
     if (page > 4096) {
-      struct Segment { uintptr_t address, size, offset, length; int protection; };
+      struct Segment {
+        uintptr_t address, size, offset, length;
+        int protection;
+      };
       std::vector<Segment> segments;
       std::string row;
       uintptr_t first = UINTPTR_MAX, last = 0;
@@ -3641,7 +3837,8 @@ int main(int argc, char **argv) {
             protections[(address - first) / page] |= flags;
         }
         for (size_t start = 0, end; start < protections.size(); start = end) {
-          for (end = start + 1; end < protections.size() && protections[end] == protections[start]; ++end) {}
+          for (end = start + 1; end < protections.size() && protections[end] == protections[start]; ++end) {
+          }
           if (mprotect(reinterpret_cast<void *>(first + start * page), (end - start) * page,
                        protections[start])) {
             close(module);
@@ -3913,8 +4110,9 @@ int main(int argc, char **argv) {
   // Version-pinned wxime initialization ABI.
   alignas(16) unsigned char config[1024]{};
   const char *work = getenv("WETYPE_WORK_DIR");
+  const std::string default_work = workspace_root + "/user";
   if (!work || !*work)
-    work = "/work/user";
+    work = default_work.c_str();
   memcpy(config + 0x18, &work, 8);
   void *logger = (void *)engine_log;
   memcpy(config, &logger, 8);
@@ -3964,7 +4162,7 @@ int main(int argc, char **argv) {
     s >> id >> version >> name;
     if (name.empty())
       continue;
-    dictionaryPaths.push_back("/input/resources/" + name);
+    dictionaryPaths.push_back(dir + "/resources/" + name);
     static const std::array<std::string, 3> wubiNames{
         "swbd86.bin", "swbd98.bin", "swbdnc.bin"};
     for (unsigned solution = 0; solution < dictionarySets.size(); ++solution) {

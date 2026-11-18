@@ -11,6 +11,13 @@ if(POLICY CMP0169)
 endif()
 include(GNUInstallDirs)
 include(FetchContent)
+option(WETYPE_FLATPAK "Use the surrounding Flatpak sandbox for engine processes" OFF)
+set(WETYPE_SANDBOX bwrap)
+if(WETYPE_FLATPAK)
+  set(WETYPE_SANDBOX "${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-flatpak-sandbox")
+  install(PROGRAMS scripts/flatpak_sandbox.py DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME fcitx5-wetypex-flatpak-sandbox)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Fcitx5Core 5.0.14 REQUIRED)
@@ -80,11 +87,13 @@ if(NOT WETYPE_LAYER_SHELL STREQUAL "OFF")
 endif()
 add_executable(fcitx5-wetypex-settings src/settings/main.cpp)
 target_link_libraries(fcitx5-wetypex-settings PRIVATE ${WETYPE_QT_PACKAGE}::Widgets ${WETYPE_QT_PACKAGE}::DBus ${WETYPE_QT_PACKAGE}::Network ${WETYPE_QT_PACKAGE}::Svg)
+target_link_libraries(fcitx5-wetypex-settings PRIVATE Fcitx5Qt${WETYPE_UI_QT_MAJOR}::WidgetsAddons Fcitx5::Utils)
 target_compile_definitions(fcitx5-wetypex-settings PRIVATE
   WETYPE_ACCOUNT_TOOL="${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-account"
   WETYPE_BACKEND="${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-backend"
   WETYPE_TRANSFER="${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-transfer"
   WETYPE_SETUP="${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-setup"
+  WETYPE_VOICE_TOOL="${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-voice"
   WETYPE_RUNTIME_PROFILES="${CMAKE_INSTALL_FULL_DATADIR}/fcitx5-wetypex/runtime-profiles.json"
   WETYPE_VERSION="${PROJECT_VERSION}-${WETYPE_PACKAGE_RELEASE}")
 add_executable(fcitx5-wetypex-clipboard-set src/clipboard/main.cpp)
@@ -126,7 +135,10 @@ endif()
 set(WETYPE_SUPPORT_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/fcitx5-wetypex")
 add_executable(wetypex-engine-host src/backend/macos_host.cpp)
 set(WETYPE_QEMU_AARCH64 "/usr/bin/qemu-aarch64" CACHE FILEPATH "ARM64 userspace compatibility provider")
-target_compile_definitions(wetypex-engine-host PRIVATE WETYPE_QEMU_AARCH64="${WETYPE_QEMU_AARCH64}")
+set(WETYPE_QEMU_X86_64 "/usr/bin/qemu-x86_64" CACHE FILEPATH "x86-64 userspace compatibility provider")
+target_compile_definitions(wetypex-engine-host PRIVATE
+  WETYPE_QEMU_AARCH64="${WETYPE_QEMU_AARCH64}"
+  WETYPE_QEMU_X86_64="${WETYPE_QEMU_X86_64}")
 add_dependencies(wetypex-engine-host kqueue)
 target_link_libraries(wetypex-engine-host PRIVATE PkgConfig::JSONC Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(wetypex-engine-host PRIVATE -Wall -Wextra)
@@ -141,7 +153,7 @@ if(CMAKE_CROSSCOMPILING)
     list(APPEND WETYPE_CLANG_TARGET_FLAGS "--sysroot=${CMAKE_SYSROOT}")
   endif()
 endif()
-if(WETYPE_ARCHITECTURE MATCHES "^(aarch64|arm64)$")
+if(WETYPE_ARCHITECTURE MATCHES "^(aarch64|arm64)$" OR WETYPE_DARWIN_LIBCXX_ROOT)
   include(cmake/DarwinLibcxx.cmake)
 endif()
 option(WETYPE_BUNDLED_CURL "Embed pinned WebSocket-capable libcurl in the transport bridge" ON)
@@ -179,7 +191,7 @@ add_library(wetypex MODULE src/plugin/wetype.cpp)
 set_target_properties(wetypex PROPERTIES PREFIX "")
 if(Fcitx5Core_VERSION VERSION_GREATER_EQUAL "5.1")
   # Recent Fcitx headers use span/ranges; older stable SDKs work with C++17.
-  set_target_properties(wetypex PROPERTIES CXX_STANDARD 20)
+  set_target_properties(wetypex fcitx5-wetypex-settings PROPERTIES CXX_STANDARD 20)
 endif()
 target_link_libraries(wetypex PRIVATE Fcitx5::Core Fcitx5::Config Fcitx5::Utils
   Fcitx5::Module::Clipboard Fcitx5::Module::Spell LibIME::Pinyin PkgConfig::JSONC)
@@ -197,6 +209,7 @@ target_compile_definitions(wetypex PRIVATE WETYPE_UPDATE="${CMAKE_INSTALL_FULL_B
 target_compile_definitions(wetypex PRIVATE WETYPE_SETUP="${CMAKE_INSTALL_FULL_BINDIR}/fcitx5-wetypex-setup")
 target_compile_options(wetypex PRIVATE -Wall -Wextra)
 
+include(cmake/VoiceProtocol.cmake)
 configure_file(data/wetypex-addon.conf.in wetypex-addon.conf @ONLY)
 configure_file(scripts/fcitx5-wetypex-backend.sh.in fcitx5-wetypex-backend @ONLY)
 configure_file(scripts/runtime_lease.sh.in runtime-lease.sh @ONLY)
@@ -237,7 +250,7 @@ install(FILES data/fcitx5-wetypex-settings.desktop DESTINATION ${CMAKE_INSTALL_D
 install(DIRECTORY data/icons/hicolor/ DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor)
 install(PROGRAMS scripts/setup_runtime.py tools/prepare_macos_runtime.py DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/runtime-lease.sh DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
-install(FILES scripts/wechat_emoticons.py scripts/runtime_catalog.py scripts/runtime_manager.py data/runtime-profiles.json DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
+install(FILES scripts/wechat_emoticons.py scripts/runtime_catalog.py scripts/runtime_manager.py scripts/group_sync.py data/runtime-profiles.json DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
 install(FILES scripts/voice_stream.py DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
 install(FILES ${kqueue_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/fcitx5-wetypex RENAME libkqueue-LICENSE)
 install(FILES ${kqueue_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/fcitx5-wetypex RENAME libkqueue-ISC-LICENSE)
@@ -249,3 +262,5 @@ install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/fcitx5-wetypex/
 set(CPACK_PACKAGE_CONTACT "WeTypeX community project")
 set(CPACK_GENERATOR TXZ)
 include(CPack)
+
+include(cmake/LocalVoice.cmake)

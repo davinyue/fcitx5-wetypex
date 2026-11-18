@@ -18,6 +18,8 @@ contents:
     type: tree
 overrides:
   deb:
+    suggests:
+      - zenity | kdialog
     depends:
       - libc6 (>= 2.35)
       - libstdc++6 (>= 11)
@@ -45,10 +47,13 @@ overrides:
       - libwayland-client0
       - pipewire-bin | pipewire
       - ffmpeg
+      - opencc
       - wl-clipboard
       - libnotify-bin
       - pkexec | policykit-1
   rpm:
+    suggests:
+      - (zenity or kdialog)
     depends:
       - glibc
       - libcxx
@@ -71,6 +76,7 @@ overrides:
       - libwayland-client
       - pipewire-utils
       - /usr/bin/ffmpeg
+      - /usr/bin/opencc
       - wl-clipboard
       - libnotify
       - polkit

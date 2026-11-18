@@ -32,7 +32,7 @@ AUR 包在本机编译，链接本机的库：
 paru -S fcitx5-wetypex
 ```
 
-ARM64 软件包把 `qemu-user` 列为可选依赖，用于不满足原版 CPU 特性要求的处理器，见 [ARM64 支持](arm64.md)。
+原生包按需要使用 `qemu-user`，Arch 包将其列为可选依赖；Flatpak 扩展自带当前架构的兼容执行器。输入和语音按各自需要的 CPU 指令集分别选择执行方式，见 [CPU 指令集与兼容执行](architecture.md#cpu-指令集与兼容执行)。
 
 ## Debian 与 Ubuntu
 
@@ -114,6 +114,21 @@ outputs = { nixpkgs, wetypex, ... }: {
 };
 ```
 
+也可通过默认 overlay 使用 `pkgs.fcitx5-wetypex`，让包直接跟随当前系统的 Nixpkgs 和其他 overlays：
+
+```nix
+{ pkgs, ... }: {
+  nixpkgs.overlays = [ wetypex.overlays.default ];
+  i18n.inputMethod = {
+    enable = true;
+    type = "fcitx5";
+    fcitx5.addons = [ pkgs.fcitx5-wetypex ];
+  };
+}
+```
+
+将这段模块放入上例的 `modules`，其中 `wetypex` 来自 flake 的 `outputs` 参数。包的 `.override` 参数同样可用于 overlay 提供的包。
+
 ### 构建参数
 
 Nix 包支持通过 `.override` 调整以下参数：
@@ -124,7 +139,7 @@ Nix 包支持通过 `.override` 调整以下参数：
 | `enableVoice` | `true` | 设为 `false` 时隐藏语音页面和快捷键、阻断语音调用，并移除语音辅助程序、采集脚本及其工具依赖。 |
 | `enableLayerShell` | `true` | 设为 `false` 时 V 快捷栏改用 Fcitx 原生候选菜单，V 模式功能保留。 |
 | `enableWeTypeTheme` | `true` | 设为 `false` 时隐藏皮肤和字号控件，WeTypeX 不再改写共用的 `classicui.conf`，由桌面主题统一管理。之前写入的皮肤设置需自行恢复。 |
-| `enableCompatibilityProvider` | `false` | 仅对 ARM64 生效。设为 `true` 时把 QEMU 用户态模拟器加入闭包，供不满足原版 CPU 特性要求的处理器使用，见 [ARM64 支持](arm64.md)。 |
+| `enableCompatibilityProvider` | `false` | 设为 `true` 时只把当前架构的 QEMU 用户态模拟器加入闭包，用于缺少原版所需指令的 x86-64 或 ARM64 CPU，见 [CPU 指令集与兼容执行](architecture.md#cpu-指令集与兼容执行)。 |
 | `defaultSettings` | `{ }` | Nix 属性集，键名沿用 `wetypex.json`，仅在偏好文件不存在时写入首次默认值。 |
 
 示例：
@@ -161,7 +176,7 @@ cmake --build build --parallel
 sudo cmake --install build
 ```
 
-构建要求 CMake 3.16+、Clang、C++17 编译器、Python 3.8+ 以及 Fcitx5、LibIME、Qt 5.12+ 或 Qt6、json-c、Boost、OpenSSL、Wayland 客户端库等开发包；Fcitx5 插件在新版 Fcitx SDK 下以 C++20 编译。ARM64 的私有 libc++ 需要 CMake 3.20+ 和 Clang 16+。
+构建要求 CMake 3.16+、Clang、C++17 编译器、Python 3.8+、Rust 1.73+（只用于构建原生离线解码器，无 Cargo 依赖）以及 Fcitx5、LibIME、Qt 5.12+ 或 Qt6、json-c、Boost、OpenSSL、Wayland 客户端库等开发包；Fcitx5 插件在新版 Fcitx SDK 下以 C++20 编译。ARM64 的私有 libc++ 需要 CMake 3.20+ 和 Clang 16+。本地语音繁体输出需安装运行时工具 `opencc`。
 
 常用 CMake 选项：
 

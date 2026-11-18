@@ -50,6 +50,12 @@ fcitx5-wetypex-setup --check
 | `core_error` 提到需要兼容执行组件 | ARM64 CPU 缺少所需特性，安装 `qemu-user`，见 [ARM64 支持](arm64.md) |
 | 报告 SHA-256 不匹配或没有兼容档案 | 文件不是兼容清单中的官方版本。保持校验开启，改用 `--download` 或官方原始 ZIP |
 
+### 旧 CPU 在配对或联网初始化时出现 SIGILL
+
+先运行 `fcitx5-wetypex-account network-info`，查看 `native_cpu_supported`、`execution_provider` 和 `execution_ready`。部分老 x86-64 CPU 同时缺少 AES-NI 和 AVX2，无法直接执行原版的软件 AES 初始化。默认 `auto` 模式会改用同架构 QEMU；语音另有 AVX2/FMA 要求，诊断结果中的 `voice_execution_ready` 表示语音执行方式是否可用。请安装支持所需指令集的 `qemu-user`，Nix 用户启用 `enableCompatibilityProvider = true`。
+
+若已安装 QEMU 而 `execution_ready` 仍为 `false`，需要更新模拟器。诊断会实际检查其指令集能力；Ubuntu 22.04 自带的 QEMU 6.2 不满足这里的 x86 要求。详见 [CPU 指令集与兼容执行](architecture.md#cpu-指令集与兼容执行)。
+
 ### 更新一直显示“已准备”
 
 - 显示“更新已准备。首次升级请重启 Fcitx5”：当前运行的是旧插件，请[重启 Fcitx5](installation.md#重启-fcitx5)一次。KDE Plasma Wayland 请用虚拟键盘切换或重新登录。
@@ -71,6 +77,12 @@ fcitx5-wetypex-setup --check
 清理保留当前版本代、一个回退版本代、待应用的版本代和回退所需的数据快照，并保留迁移前的 `original-*` 目录等无法自动判断的文件。先运行 `fcitx5-wetypex-setup --cleanup --dry-run` 查看计划，再参阅[清理与存储](runtime-updates.md#清理与存储)。输出含 `deferred` 时，说明有更新正在进行，稍后再试。
 
 ## 输入与候选
+
+### Nix 安装核心时提示字体目录只读
+
+Home Manager 等声明式配置可能把 `~/.local/share/fonts` 链接到只读的 Nix store。更新器会改用 `~/.local/share/fcitx5-wetypex/fonts`，并通过专属的 `~/.config/fontconfig/conf.d/99-fcitx5-wetypex.conf` 注册原版表情字体，已有的自定义文件不会被覆盖。若字体目录和 Fontconfig 配置均不可写，核心仍可安装，表情候选暂时使用文字标签。字体文件也保留在当前运行时的 `assets/fonts/` 中，不会修改声明式字体目录。
+
+更新适配层后重新运行“下载并更新原版核心”，或执行 `fcitx5-wetypex-setup --update --download --accept-upstream-license`。先前中断的安装会恢复后继续，账户和词库沿用原有数据。
 
 ### 界面正常，但中文没有候选或无法上屏
 
@@ -101,6 +113,28 @@ env GTK_IM_MODULE=fcitx application --ozone-platform=x11
 ```
 
 Arch 的模块包为 `fcitx5-gtk`，Debian/Ubuntu 通常为 `fcitx5-frontend-gtk3`，版本应与当前 Fcitx 框架匹配。可把命令写入该应用的用户级 `.desktop` 启动项，保留原命令中的路径和占位参数。这些调整只作用于对应应用。
+
+### Chrome 的地址栏与网页引号行为不同
+
+先按[自动配对标点规则](input-handling.md#自动配对标点)逐次检查输入结果。原版会根据光标前后文字和选区决定是否配对；客户端提供的上下文不同，结果也可能不同。特别是 Chromium 的部分 GTK 输入法桥接不提供周边文本，此时输入法无法确认光标是否已经位于一对符号之间。
+
+在已配置 Fcitx5 的 KDE Plasma Wayland 会话中，可完整退出 Chrome，再用原生 Wayland 输入通道启动：
+
+```sh
+env -u GTK_IM_MODULE -u QT_IM_MODULE google-chrome-stable --ozone-platform=wayland --enable-wayland-ime
+```
+
+将 `google-chrome-stable` 换成实际使用的 Chrome 或 Chromium 命令。浏览器已有进程时，新命令可能复用旧进程，启动参数也就不会生效。以上命令只调整这次启动的浏览器环境。
+
+NixOS 的 Fcitx5 模块默认会设置 GTK 和 Qt 输入法环境变量；使用 Wayland 前端时，可在现有配置中设置：
+
+```nix
+i18n.inputMethod.fcitx5.waylandFrontend = true;
+```
+
+这一系统选项会影响 GTK 和 Qt 应用的通道选择，并保留 X11 使用的 `XMODIFIERS`；只调整 Chrome 时可使用上面的单应用启动命令，见 [NixOS 模块实现](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/nixos/modules/i18n/input-method/fcitx5.nix)。KDE 中还需在“系统设置 → 键盘 → 虚拟键盘”选择 Fcitx 5。
+
+Qt 输入法模块的部分版本还会在只更新光标矩形时撤回周边文本能力。Fcitx Qt 的[上游修正](https://github.com/fcitx/fcitx5-qt/commit/357ded98b9958e77026ae072a7340d0cd20843a9)已限制为实际查询周边文本后才撤回；受影响的旧模块可使用桌面支持的原生 Wayland 通道。WeTypeX 尊重客户端当前声明的能力，避免用旧选区包裹或覆盖新的正文。
 
 ### Wayland 下 V 快捷栏不显示或闪退
 
@@ -133,6 +167,10 @@ fcitx5-wetypex-account sync-now
 
 `requested: true` 表示原版输入核心接受了请求；下载与跨设备结果请在关联设备上确认。
 
+后台轮询每次成功读取设备组后，会将功能开关和常用语版本交给正在运行的原版核心；核心尚未启动或忙碌时，后续轮询会重试。`state/sync-runtime.json` 的 `core_sync_requested` 记录最近一次成功轮询的本地交接确认，常用语上传与下载由原版核心异步执行。
+
+`core_sync_error` 记录最近一次交接失败的原因。升级后若提示“同步组件版本不匹配”，重启 Fcitx5 以加载新的适配层；原版核心版本可保持不变。
+
 `state/sync-runtime.json` 中的 `remote_version`、`local_kind` 和 `local_digest` 只描述剪贴板状态。原版核心的 `state/user/persistent_data`、`state/user/network` 与 `state/userDict` 在重启后保留，排查普通连接故障时请保持这些目录原样。
 
 ### 跨设备剪贴板没有同步
@@ -159,11 +197,11 @@ wl-copy --version
 
 ### 语音没有识别结果
 
-1. 确认单机模式关闭，语音识别需要联网；首次使用会初始化设备身份。
+1. 先核对“语音输入 → 识别方式”：原版在线识别需关闭单机模式并联网，首次使用会初始化设备身份；本地离线识别可在单机模式使用，通过 `fcitx5-wetypex-voice model status` 检查模型是否就绪，缺失时在设置中下载或修复。
 2. 按[流式语音输入](voice-input.md#诊断)中的命令单独录制几秒，确认默认输入设备有声音。
 3. 运行 `fcitx5-wetypex-voice status`，检查 `capture_backend`、`native_ready`、`vad`、`state` 和 `timings`。
-4. 查看 `~/.local/share/fcitx5-wetypex/state/voice/capture.log`（录音错误）和 `backend.log`（原版宿主错误）。
-5. 宿主运行时 `vad` 仍为 `false`，或日志报告 VAD 文件缺失时，先运行 `fcitx5-wetypex-voice shutdown`，再运行 `fcitx5-wetypex-setup --repair-voice-resources --download --accept-upstream-license` 恢复模型。离线修复与说明见[修复语音资源](voice-input.md#修复语音资源)。
+4. 查看 `~/.local/share/fcitx5-wetypex/state/voice/capture.log`（录音错误）；原版在线识别的宿主日志为 `backend.log`，本地离线解码器日志为 `local-backend.log`。
+5. 原版在线识别的宿主运行时 `vad` 仍为 `false`，或日志报告 VAD 文件缺失时，先运行 `fcitx5-wetypex-voice shutdown`，再运行 `fcitx5-wetypex-setup --repair-voice-resources --download --accept-upstream-license` 恢复资源。本地离线模式的 `vad: false` 属于正常状态。VAD 资源的本地导入与说明见[修复语音资源](voice-input.md#修复语音资源)。
 
 Ubuntu 22.04 的 `pw-record` 0.3.48 不支持 `--raw` 和 `--properties`；WeTypeX 会检测实际选项，自动改用 `parec` 或 FFmpeg 的 PulseAudio 输入。
 
@@ -174,6 +212,12 @@ Ubuntu 22.04 的 `pw-record` 0.3.48 不支持 `--raw` 和 `--properties`；WeTyp
 Wayland 下复制优先使用兼容的 data-control 协议；旧版 wl-clipboard 与桌面协议不匹配时，尝试通过 XWayland 静默复制；都不可用时跳过复制。可检查 `wl-copy --version`、`fcitx5-wetypex-clipboard-set --wayland-clipboard-protocols` 以及应用实际使用的输入法通道。VS Code 等 Electron 应用也可以按[上文](#electron-应用在-wayland-下候选框固定在左上角)尝试原生 Wayland 或 XWayland。
 
 ## 界面
+
+### 候选字体被重置
+
+候选字体由 Fcitx5 的“经典用户界面”设置管理。WeTypeX 保存输入选项或切换主题时会保留现有字体和字号；只有主动调整“候选字大小”才修改字号，并保留字体、字重、斜体及其他字体属性。菜单和托盘字体分别沿用 Fcitx5 的设置。
+
+如果字体已被旧版本覆盖，请在更新适配层后，到 Fcitx5 的经典用户界面中重新选择一次所需字体。
 
 ### Qt5 设置窗口偏小
 

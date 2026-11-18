@@ -41,7 +41,7 @@
 | 账户与设备 | 官方六位匹配码、确认配对、设备组和功能开关 |
 | 跨设备剪贴板 | 文字与原始 PNG 图片双向同步 |
 | 个人词库与常用语 | 本地持久化，接入原版设备组同步 |
-| 语音输入 | PipeWire/PulseAudio 流式采集，原版语音引擎识别并实时显示预编辑 |
+| 语音输入 | PipeWire/PulseAudio 流式采集；默认原版在线识别，可按需下载腾讯、X-ASR、Qwen3-ASR、FireRedASR2 或 Fun-ASR-Nano 模型用于本地离线识别 |
 | 问 AI | `=` 以光标前文本提问，在独立窗口显示回答 |
 | 隔空传送 | 官方传输码与二维码，原版 Flurry 局域网与 WXP2P 直连/中继通道 |
 | V 模式 | 计算、剪贴板、常用语和符号快捷栏 |
@@ -55,7 +55,7 @@ WeTypeX 由两部分组成：
 - **适配层**：本仓库构建的开源软件包，包括 Fcitx5 插件、ABI 兼容宿主、设置界面和辅助命令。由包管理器或 Nix 安装。
 - **原版运行时**：首次设置时从微信输入法官方下载服务获取的专有组件，校验 SHA-256 后保存在用户目录。WeTypeX 的源码包和软件包都不含这些二进制文件或资源。
 
-当前默认原版输入核心为 3.0.1.684；隔空传送模块、语音模型和界面资源继续取自经过验证的 2.2.3.657 安装包。设置中的“原版输入核心”版本只表示核心，适配层版本独立显示。
+当前默认原版输入核心为 3.0.1.684；隔空传送模块、语音 VAD 和界面资源继续取自经过验证的 2.2.3.657 安装包。可选离线语音另行下载官方识别模型。设置中的“原版输入核心”版本只表示核心，适配层版本独立显示。
 
 ```text
 应用程序
@@ -71,16 +71,18 @@ WeTypeX 插件 ────────── 候选、预编辑、快捷键、�
 原版业务服务 ────────── 云候选、配对、同步、语音、AI
 ```
 
-输入宿主和账户命令运行在 Bubblewrap 沙箱中。密码输入框不会进入原版核心、剪贴板记录或 AI。详见[架构说明](docs/architecture.md)。
+输入宿主和账户命令运行在受限子进程中：原生包使用 Bubblewrap，Flatpak 扩展使用 Flatpak 子沙箱。密码输入框不会进入原版核心、剪贴板记录或 AI。详见[架构说明](docs/architecture.md)。
 
 ## 安装
+
+Flatpak 版 Fcitx5 用户可使用 [WeTypeX 扩展](docs/flatpak.md)，目前提供开发构建和 CI 安装包。
 
 从 [GitHub Releases](https://github.com/panxuc/fcitx5-wetypex/releases/latest) 下载与系统和架构匹配的软件包。下列示例使用 x86-64 文件名，ARM64 文件名在注释中给出。
 
 ### Arch Linux
 
 ```bash
-sudo pacman -U ./fcitx5-wetypex-3.0.1.684-3-x86_64.pkg.tar.zst   # ARM64: ...-aarch64.pkg.tar.zst
+sudo pacman -U ./fcitx5-wetypex-3.0.1.684-8-x86_64.pkg.tar.zst   # ARM64: ...-aarch64.pkg.tar.zst
 # 或从 AUR 在本机构建
 paru -S fcitx5-wetypex
 ```
@@ -90,7 +92,7 @@ paru -S fcitx5-wetypex
 标准包支持 Ubuntu 22.04 及更新版本、Debian 12/13。
 
 ```bash
-sudo apt install ./fcitx5-wetypex_3.0.1.684-3_amd64.deb          # ARM64: ..._arm64.deb
+sudo apt install ./fcitx5-wetypex_3.0.1.684-8_amd64.deb          # ARM64: ..._arm64.deb
 ```
 
 ### Ubuntu 20.04
@@ -98,19 +100,19 @@ sudo apt install ./fcitx5-wetypex_3.0.1.684-3_amd64.deb          # ARM64: ..._ar
 需先安装稳定版 Fcitx5 框架，见[安装指南](docs/installation.md#ubuntu-2004-legacy-deb)。
 
 ```bash
-sudo apt install ./fcitx5-wetypex-legacy_3.0.1.684-3_amd64.deb   # ARM64: ..._arm64.deb
+sudo apt install ./fcitx5-wetypex-legacy_3.0.1.684-8_amd64.deb   # ARM64: ..._arm64.deb
 ```
 
 ### Fedora 及兼容的 RPM 发行版
 
 ```bash
-sudo dnf install ./fcitx5-wetypex-3.0.1.684-3.x86_64.rpm          # ARM64: ...-3.aarch64.rpm
+sudo dnf install ./fcitx5-wetypex-3.0.1.684-8.x86_64.rpm          # ARM64: ...-8.aarch64.rpm
 ```
 
 ### 便携归档
 
 ```bash
-sudo tar --zstd -C / -xf ./fcitx5-wetypex-3.0.1.684-3-linux-x86_64.tar.zst   # ARM64: ...-linux-aarch64.tar.zst
+sudo tar --zstd -C / -xf ./fcitx5-wetypex-3.0.1.684-8-linux-x86_64.tar.zst   # ARM64: ...-linux-aarch64.tar.zst
 ```
 
 NixOS flake、源码构建、各格式的构建基线与依赖说明见[安装指南](docs/installation.md)。ARM64 的 CPU 要求和旧 CPU 兼容方式见 [ARM64 支持](docs/arm64.md)。

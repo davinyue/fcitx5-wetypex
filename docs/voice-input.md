@@ -1,8 +1,51 @@
 # 流式语音输入
 
-WeTypeX 边录音边识别。PipeWire 或 PulseAudio 采集 16 kHz、单声道、16 位 PCM，交给当前原版输入核心中的 `voice_engine_*` C 接口；原版引擎完成 Opus 编码、VAD、分包、重试、中间结果、最终结果和智能整理。Fcitx5 负责在输入框中显示预编辑和提交文字。
+WeTypeX 边录音边识别。PipeWire 或 PulseAudio 采集 16 kHz、单声道、16 位 PCM，Fcitx5 在当前输入框中显示预编辑并提交最终文字。在线、离线识别共用快捷键、麦克风、标点、取消和上屏流程。
 
-语音识别需要联网。单机模式下语音快捷键不会启动录音。
+## 选择识别方式
+
+在“语音输入 → 识别方式”中选择：
+
+| 方式 | 行为 |
+| --- | --- |
+| 原版在线（默认） | 调用当前原版核心的 `voice_engine_*` 接口，保留原版 Opus、VAD、分包、重试、识别与智能整理；需要联网 |
+| 本地离线 | 按需选择并下载模型，由原生 CPU 解码进程在本机识别；单机模式下也可使用 |
+
+选择本地离线后，选择模型，再点击“下载模型”。已有腾讯模型继续使用原来的目录，无须重新下载。
+
+| 模型 | 出字方式 | 下载 / 安装后大小（约） |
+| --- | --- | --- |
+| 微信输入法官方模型（默认） | 边说边出字 | 103 / 136 MB |
+| X-ASR | 160 ms 流式模型，边说边出字 | 615 / 615 MB |
+| Qwen3-ASR 0.6B INT8 | 停顿后分段出字 | 879 / 987 MB |
+| FireRedASR2 CTC INT8 | 停顿后分段出字 | 521 / 776 MB |
+| Fun-ASR-Nano INT8 | 停顿后分段出字 | 842 / 1010 MB |
+
+X-ASR 及其后三个模型共用一份原生 sherpa-onnx / ONNX Runtime CPU 组件，首次额外下载约 26 MB（ARM64 约 29 MB），安装后约 32 / 40 MB。模型权重跨架构通用。没有 GPU、PyTorch 或 Python 包安装步骤。首次使用较大模型需要载入；后续会话复用已载入的模型，空闲两分钟后释放内存。
+
+下载可取消和续传，每个文件均校验固定 SHA-256；实际加载成功后才启用新模型。成功后清理压缩包和旧代文件。删除所选模型保留其他模型；最后一个可选模型删除时同时清理共享组件。模型不随软件包分发，也不计入原版核心的版本代。设置会显示当前模型的来源、许可和大小。
+
+离线进程使用独立网络命名空间，不调用原版联网语音宿主；模型缺失、损坏或处理失败会明确报错，不自动切换到在线识别。输入法的其他联网功能仍由“单机模式”等各自开关控制。智能整理只在原版在线识别时使用，切回在线后恢复原有设置。离线模型的语言覆盖、准确率、标点与在线引擎有所区别。
+
+腾讯模型使用自带的原生 x86-64 / ARM64 解码器，不需要 ONNX Runtime。x86 按 CPU 能力选择 AVX2/AVX-VNNI 或基础指令路径；ARM64 使用基础 NEON。可选模型使用按需下载的原生 CPU 组件；两种方式均不需要 QEMU。本地繁体输出通过 OpenCC 转换，发行包提供相应依赖；源码安装时需安装 `opencc`。
+
+升级后，空闲的旧版语音服务会自动退出并以新协议启动；正在进行的旧会话会提示先结束再重试。
+
+软件包升级后仍须按安装流程重启 Fcitx5，使主输入法加载新插件，再选择新的识别方式；控制服务迁移不能代替插件重新加载。Flatpak 的独立运行实例按各自的进程命名空间启动录音任务；另一个实例正在识别时会提示结束后重试。
+
+命令行管理同一套模型：
+
+```bash
+fcitx5-wetypex-voice model list
+fcitx5-wetypex-voice model status
+fcitx5-wetypex-voice model install --accept-upstream-license
+fcitx5-wetypex-voice model verify
+fcitx5-wetypex-voice model remove
+# 也可显式指定：wetype / xasr / qwen3 / firered / funasr
+fcitx5-wetypex-voice model install --model xasr --accept-upstream-license
+```
+
+可用 `model install --archive /path/to/model.apk --accept-upstream-license` 导入相同的官方资源包。校验清单固定于 `data/local-voice-model.json`，模型更新随兼容性验证后的适配层更新提供。腾讯模型目录是 `~/.local/share/fcitx5-wetypex/voice/local/`，可选模型与共享组件在 `voice/sherpa/` 下，删除模型保留语音偏好和原版在线功能。正在进行离线录音或识别时拒绝替换、删除；空闲解码器会先释放模型。
 
 ## 使用
 
@@ -18,7 +61,9 @@ WeTypeX 边录音边识别。PipeWire 或 PulseAudio 采集 16 kHz、单声道�
 
 中间结果显示为预编辑，最终文本只提交一次。显示位置遵循外观中的“拼音显示位置”，输入框不支持内嵌预编辑时使用 Fcitx 候选面板。启动语音前若有未完成的拼音，会先按原始拼写提交。
 
-快捷键可在设置中修改。普通按键形式的快捷键也支持按住使用，自动重复不会反复启动或取消录音。
+在“语音输入”或“快捷键”页面点击按键区域，再按想使用的快捷键即可修改，也支持单独的右 Alt。两个页面会同步显示；“清空”解除绑定，“默认”恢复上表中的原版快捷键。录入时按 Esc 取消。
+
+普通按键形式的快捷键也支持按住使用，自动重复不会反复启动或取消录音。快捷键需要传递到正在使用 WeTypeX 的文本框；若被桌面环境或应用占用，请改用其他按键。
 
 ### 提交与剪贴板
 
@@ -44,6 +89,7 @@ PulseAudio 客户端路径同样适用于 pipewire-pulse。设置页可以枚举
 
 - 已选设备断开后显示“当前不可用”，可重新选择设备或改用“自动检测”。
 - 明确指定 PipeWire 设备时不会改用默认麦克风；连续 5 秒没有收到音频时结束录音并提示检查设备和音频服务。静音的设备仍会返回静音数据，不触发这项超时。
+- PipeWire 录音流固定使用启动时选定的设备，避免 WirePlumber 恢复旧的应用路由、覆盖当前选择。修改麦克风后，下次录音生效。
 - 音频后端变化后，旧的数字设备编号不会被当作另一个后端的同编号设备，请重新选择麦克风或使用“自动检测”。
 
 ## 原版语音资源
@@ -86,8 +132,9 @@ fcitx5-wetypex-voice status
 
 | 字段 | 含义 |
 | --- | --- |
-| `native_ready` | 原版语音宿主已启动 |
-| `vad` | 宿主运行时已加载原版 VAD 模型；宿主空闲释放后与 `native_ready` 一起变为 `false` |
+| `native_ready` | 当前识别宿主已启动 |
+| `provider` | `original` 为原版在线，`local` 为本地离线 |
+| `vad` | 在线宿主运行时已加载原版 VAD 模型；宿主空闲释放后与 `native_ready` 一起变为 `false` |
 | `capture_backend` | 使用的采集方式，见上表 |
 | `capture_pid` | 采集进程运行时的进程号 |
 | `state` | 当前会话状态 |
@@ -102,7 +149,7 @@ pw-record --rate 16000 --channels 1 --format s16 /tmp/wetypex-test.wav
 parec --file-format=wav --rate=16000 --channels=1 --format=s16le > /tmp/wetypex-test.wav
 ```
 
-转写已有音频文件（会连接原版语音服务）：
+用当前选择的识别方式转写已有音频文件：
 
 ```bash
 fcitx5-wetypex-voice transcribe /path/to/recording.wav
@@ -110,12 +157,17 @@ fcitx5-wetypex-voice transcribe /path/to/recording.wav
 
 加上 `--realtime --verbose` 可按音频实际时长送入并查看中间状态。`fcitx5-wetypex-account voice-file recording.opus` 使用同一引擎。
 
+文件转写遵循当前选择的识别方式；加上 `--traditional` 输出繁体。离线单次输入上限为十分钟，达到时自动结束并保留已识别结果，可再启动下一段。腾讯模型的 `WETYPE_LOCAL_VOICE_CPU=scalar` 可用于排查旧 x86 CPU 的兼容性，通常保持自动选择即可。
+
+文件超过上限时结果包含 `truncated: true`、`limit_reached: true` 与 `reason: duration_limit`，同时向标准错误输出提示；需要完整转写时请先分段。
+
 日志位于 `~/.local/share/fcitx5-wetypex/state/voice/`：
 
 | 文件 | 内容 |
 | --- | --- |
 | `capture.log` | 录音进程错误 |
 | `backend.log` | 原版语音宿主错误 |
+| `local-backend.log` | 本地解码器错误 |
 | `daemon.log` | 控制服务日志 |
 
 状态与日志保存在私有目录，可能包含识别文本或账户标识。分享时只提供状态字段、耗时和脱敏后的错误信息。
@@ -124,7 +176,7 @@ fcitx5-wetypex-voice transcribe /path/to/recording.wav
 
 输入法激活时准备一个轻量控制服务，通过同用户的 Unix socket 接收快捷键命令，停止录音时无需等待 Python 进程启动。录音期间每 40 ms 检查一次识别结果，与设备同步的节拍相互独立。
 
-原版宿主使用独立的语音业务缓存和账户身份快照，录音不会长时间占用设备同步所需的账户锁；主账户切换或退出后，下一次语音会重建对应缓存。原版宿主空闲两分钟后释放，控制服务空闲十分钟后退出。
+原版宿主使用独立的语音业务缓存和账户身份快照，录音不会长时间占用设备同步所需的账户锁；主账户切换或退出后，下一次在线语音会重建对应缓存。本地识别不需要账户身份。识别宿主空闲两分钟后释放，控制服务空闲十分钟后退出。
 
 会话以输入上下文、epoch 和唯一 token 关联。取消、快速松键、控制进程退出或宿主故障都会结束采集，旧会话的中间结果和最终结果被丢弃。
 

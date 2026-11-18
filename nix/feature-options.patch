@@ -1,6 +1,7 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -24,33 +24,47 @@
+@@ -32,33 +32,47 @@
  pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
  pkg_check_modules(WETYPE_WAYLAND REQUIRED IMPORTED_TARGET wayland-client)
  find_package(Threads REQUIRED)
@@ -52,7 +53,7 @@
  add_executable(fcitx5-wetypex-transfer src/transfer/main.cpp)
  target_link_libraries(fcitx5-wetypex-transfer PRIVATE ${WETYPE_QT_PACKAGE}::Widgets ${WETYPE_QT_PACKAGE}::Network)
  target_compile_definitions(fcitx5-wetypex-transfer PRIVATE
-@@ -221,11 +235,18 @@
+@@ -236,11 +250,18 @@
  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so DESTINATION ${CMAKE_INSTALL_LIBDIR}/fcitx5-wetypex)
  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/wetypex-addon.conf DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5/addon RENAME wetypex.conf)
  install(FILES data/wetypex-inputmethod.conf DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5/inputmethod RENAME wetypex.conf)
@@ -75,10 +76,10 @@
  install(FILES data/wetypex-symbols.json DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
  install(FILES data/wechat-emoticons.json DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
  install(FILES data/wechat-emoticons.json DESTINATION ${CMAKE_INSTALL_LIBDIR}/fcitx5-wetypex)
-@@ -236,7 +257,9 @@
+@@ -251,7 +272,9 @@
  install(PROGRAMS scripts/setup_runtime.py tools/prepare_macos_runtime.py DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/runtime-lease.sh DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
- install(FILES scripts/wechat_emoticons.py scripts/runtime_catalog.py scripts/runtime_manager.py data/runtime-profiles.json DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
+ install(FILES scripts/wechat_emoticons.py scripts/runtime_catalog.py scripts/runtime_manager.py scripts/group_sync.py data/runtime-profiles.json DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
 -install(FILES scripts/voice_stream.py DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
 +if(WETYPE_ENABLE_VOICE)
 +  install(FILES scripts/voice_stream.py DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5-wetypex)
@@ -86,9 +87,11 @@
  install(FILES ${kqueue_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/fcitx5-wetypex RENAME libkqueue-LICENSE)
  install(FILES ${kqueue_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/fcitx5-wetypex RENAME libkqueue-ISC-LICENSE)
  install(FILES ${kqueue_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/fcitx5-wetypex RENAME libkqueue-BSD-2-Clause-LICENSE)
+diff --git a/scripts/fcitx5-wetypex-account.sh.in b/scripts/fcitx5-wetypex-account.sh.in
+index 77cd06b0..dc360ba1 100644
 --- a/scripts/fcitx5-wetypex-account.sh.in
 +++ b/scripts/fcitx5-wetypex-account.sh.in
-@@ -6,6 +6,10 @@
+@@ -6,6 +6,10 @@ set -eu
  umask 077
  
  command_name="${1:-}"
@@ -99,9 +102,11 @@
  if [ "$command_name" = voice-file ]; then
    exec @CMAKE_INSTALL_FULL_BINDIR@/fcitx5-wetypex-voice transcribe "${2:-}"
  fi
+diff --git a/scripts/fcitx5-wetypex-backend.sh.in b/scripts/fcitx5-wetypex-backend.sh.in
+index 5d2817f4..54cf8ef0 100644
 --- a/scripts/fcitx5-wetypex-backend.sh.in
 +++ b/scripts/fcitx5-wetypex-backend.sh.in
-@@ -7,7 +7,18 @@
+@@ -7,7 +7,18 @@ umask 077
  runtime="${WETYPE_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5-wetypex/runtime}"
  state="${WETYPE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5-wetypex/state}"
  account="${WETYPE_ACCOUNT_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5-wetypex/account}"
@@ -121,7 +126,7 @@
  support="${WETYPE_SUPPORT_DIR:-@NIX_OUT@/lib/fcitx5-wetypex}"
  runtime_data="${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5-wetypex"
  if [ -f "$runtime_data/runtime-pending.json" ] || [ -f "$runtime_data/runtime-transaction.json" ]; then
-@@ -25,8 +36,8 @@
+@@ -25,8 +36,8 @@ rm -f "$state/user/persistent_data/user_dict_clean_up.bin"
  if [ "${WETYPE_DEBUG:-0}" != 1 ]; then exec 2>/dev/null; fi
  
  standalone=0
@@ -132,9 +137,11 @@
  fi
  
  # The original desktop enables cloud candidates only when networking is
+diff --git a/scripts/fcitx5-wetypex-sync.sh.in b/scripts/fcitx5-wetypex-sync.sh.in
+index e1d915f7..2b06a455 100644
 --- a/scripts/fcitx5-wetypex-sync.sh.in
 +++ b/scripts/fcitx5-wetypex-sync.sh.in
-@@ -16,9 +16,14 @@
+@@ -16,9 +16,14 @@ def main():
      if sys.argv[1:] not in ([], ["--refresh-state"]):
          raise ValueError("用法: fcitx5-wetypex-sync [--refresh-state]")
      refresh_state = sys.argv[1:] == ["--refresh-state"]
@@ -151,7 +158,10 @@
      except (OSError, ValueError):
          config = {}
      if isinstance(config, dict) and config.get("standalone", False):
---- a/scripts/init_settings.py
+diff --git a/scripts/init_settings.py b/scripts/init_settings.py
+new file mode 100644
+index 00000000..2a000f9a
+--- /dev/null
 +++ b/scripts/init_settings.py
 @@ -0,0 +1,62 @@
 +#!@NIX_PYTHON@
@@ -216,9 +226,11 @@
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/scripts/setup_runtime.py b/scripts/setup_runtime.py
+index fcfee46c..cbfeaa9a 100644
 --- a/scripts/setup_runtime.py
 +++ b/scripts/setup_runtime.py
-@@ -492,6 +492,7 @@
+@@ -488,6 +488,7 @@ def main():
          ap.error('--upstream-channel applies only to --query-upstream')
      if args.download and not args.accept_upstream_license:
          ap.error('--download requires --accept-upstream-license')
@@ -226,9 +238,10 @@
      data=pathlib.Path(os.environ.get('XDG_DATA_HOME',str(pathlib.Path.home()/'.local/share')))
      target=args.runtime_dir or pathlib.Path(os.environ.get('WETYPE_RUNTIME_DIR',str(data/'fcitx5-wetypex/runtime')))
      from runtime_manager import RuntimeManager, digest as archive_digest, lock
+diff --git a/scripts/voice_stream.py b/scripts/voice_stream.py
 --- a/scripts/voice_stream.py
 +++ b/scripts/voice_stream.py
-@@ -32,13 +32,18 @@
+@@ -32,7 +32,10 @@
  ACCOUNT = Path(os.environ.get('WETYPE_ACCOUNT_STATE_DIR', DATA / 'fcitx5-wetypex/account'))
  RUNTIME = Path(os.environ.get('WETYPE_RUNTIME_DIR', DATA / 'fcitx5-wetypex/runtime'))
  SUPPORT = Path(os.environ.get('WETYPE_SUPPORT_DIR', '@NIX_OUT@/lib/fcitx5-wetypex'))
@@ -240,6 +253,7 @@
  ADDRESS = '\0wetypex-voice-{}-{}'.format(os.getuid(), hashlib.sha256(str(STATE.resolve()).encode()).hexdigest()[:20])
  LIMIT = 131072
  
+@@ -56,6 +59,8 @@
  
  def read_json(path):
      try:
@@ -248,9 +262,11 @@
          value = json.loads(path.read_text())
          return value if isinstance(value, dict) else {}
      except (OSError, ValueError):
+diff --git a/src/backend/business_services.hpp b/src/backend/business_services.hpp
+index 9cc292cf..dfa55766 100644
 --- a/src/backend/business_services.hpp
 +++ b/src/backend/business_services.hpp
-@@ -402,6 +402,11 @@
+@@ -402,6 +402,11 @@ static bool save_business_identity(const char *path,
  
  #include "native_voice.hpp"
  static void business_service() {
@@ -262,6 +278,8 @@
    const char *identity_path = getenv("WETYPE_IDENTITY_FILE");
    BusinessIdentity identity = load_business_identity(identity_path);
    if (identity.model.empty()) {
+diff --git a/src/backend/macos_host.cpp b/src/backend/macos_host.cpp
+index 84998ad5..fa31fc62 100644
 --- a/src/backend/macos_host.cpp
 +++ b/src/backend/macos_host.cpp
 @@ -2,6 +2,12 @@
@@ -275,30 +293,29 @@
 +#define WETYPE_ENABLE_VOICE 1
 +#endif
  #include <algorithm>
- #include <array>
  #include <arpa/inet.h>
-@@ -3352,6 +3358,21 @@
-     fprintf(stderr, "usage: host PREPARED_DIR MODE [ASCII_PINYIN]\n");
-     return 2;
+ #include <array>
+@@ -3597,6 +3603,19 @@ int main(int argc, char **argv) {
    }
-+  // Reject disabled entry points before loading or initializing the original
-+  // core: a direct host invocation must fail locally without network access.
+   if (!strcmp(argv[2], "cpu-check"))
+     return original_cpu_supported(!strcmp(argv[1], "voice")) ? 0 : 78;
++  // Reject disabled entry points before loading the original core.
 +  const bool business = !strcmp(argv[2], "business-service");
 +  const char *disabled = nullptr;
 +  if (!WETYPE_ENABLE_AI && !strcmp(argv[2], "llm-service"))
 +    disabled = "AI";
 +  else if (!WETYPE_ENABLE_VOICE &&
 +           (!strcmp(argv[2], "voice-service") ||
-+            (business && (getenv("WETYPE_VOICE_STREAM") ||
-+                          getenv("WETYPE_VOICE_FILE")))))
++            (business && (getenv("WETYPE_VOICE_STREAM") || getenv("WETYPE_VOICE_FILE")))))
 +    disabled = "voice input";
 +  if (disabled) {
 +    fprintf(stderr, "%s is disabled in this build.\n", disabled);
 +    return 78;
 +  }
-   const bool mappingOnly = !strcmp(argv[2], "version") ||
-                            !strcmp(argv[2], "module-map");
-   if (!select_execution_provider(argc, argv))
+   if (const char *workspace = getenv("WETYPE_WORKSPACE")) {
+     std::error_code error;
+     const auto path = std::filesystem::canonical(workspace, error);
+diff --git a/src/plugin/config.hpp b/src/plugin/config.hpp
 --- a/src/plugin/config.hpp
 +++ b/src/plugin/config.hpp
 @@ -4,6 +4,13 @@
@@ -315,7 +332,7 @@
  
  namespace wetype_config {
  using namespace fcitx;
-@@ -146,8 +153,9 @@
+@@ -155,8 +162,9 @@
          {Key("Shift_L")},
          KeyListConstrain({KeyConstrainFlag::AllowModifierLess,
                            KeyConstrainFlag::AllowModifierOnly})};
@@ -327,7 +344,7 @@
          this,
          "AiAssistantKeys",
          "AI 助手按键",
-@@ -231,7 +239,8 @@
+@@ -240,7 +248,8 @@
  
  FCITX_CONFIGURATION(
      WeTypeConfig, Option<InputConfig> input{this, "Input", "输入"};
@@ -337,9 +354,10 @@
      Option<PhraseClipboardConfig> phrases{this, "PhrasesClipboard",
                                            "常用语和剪贴板"};
      Option<AppearanceConfig> appearance{this, "Appearance", "外观"};
+diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
 --- a/src/plugin/wetype.cpp
 +++ b/src/plugin/wetype.cpp
-@@ -13,6 +13,7 @@
+@@ -17,6 +17,7 @@
  #include <fcitx-utils/key.h>
  #include <fcitx-utils/keysym.h>
  #include <fcitx-utils/misc.h>
@@ -347,7 +365,7 @@
  #include <fcitx-utils/utf8.h>
  #include <fcitx/action.h>
  #include <fcitx/addonfactory.h>
-@@ -55,6 +56,11 @@
+@@ -61,6 +62,11 @@
  extern char **environ;
  namespace {
  using namespace fcitx;
@@ -359,8 +377,8 @@
  template <typename Context, typename Flag, typename = void>
  struct HasCursorCommit : std::false_type {};
  template <typename Context, typename Flag>
-@@ -1249,12 +1255,49 @@
-       s->symbolAutoState = 0;
+@@ -1480,6 +1486,39 @@
+     s->symbolAutoState = 0;
      return true;
    }
 +  void initializeSettings() {
@@ -396,31 +414,40 @@
 +      voice->smartPolish.setValue(false);
 +    }
 +  }
-   void reloadSettings() {
+   static std::filesystem::path configPath() {
      const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-     std::string path =
-         config ? config : std::string(home ? home : "") + "/.config";
-     const auto newPath = path + "/fcitx5/wetypex.json";
-     std::ifstream f(newPath);
-+    if (!f && preferencesMissing(newPath)) {
+     return (config && *config ? std::filesystem::path(config)
+@@ -1527,7 +1566,10 @@
+   }
+   bool rememberPunctuation(bool chinese) {
+     // Patch only this preference; settings edited by another UI stay intact.
+-    std::ifstream file(configPath());
++    const auto readPath = preferencesMissing(configPath())
++                              ? std::filesystem::path(WETYPE_DEFAULT_SETTINGS)
++                              : configPath();
++    std::ifstream file(readPath);
+     std::string bytes(16385, '\0');
+     file.read(bytes.data(), bytes.size());
+     bytes.resize(file.gcount());
+@@ -1545,6 +1587,10 @@
+   void reloadSettings() {
+     finishNumericPreviews();
+     std::ifstream f(configPath());
++    if (!f && preferencesMissing(configPath())) {
 +      f.clear();
 +      f.open(WETYPE_DEFAULT_SETTINGS);
 +    }
      std::string bytes(16385, '\0');
      f.read(bytes.data(), bytes.size());
      bytes.resize(f.gcount());
-@@ -1448,6 +1491,7 @@
-     loadKeys(shortcuts->thirdCandidateKeys, "third_candidate_keys");
-     config_.update.mutableValue()->autoUpdate.setValue(
-         boolSetting("auto_update", true));
+@@ -1761,10 +1807,14 @@
+       if (j && json_object_is_type(j.get(), json_type_object))
+         json_object_object_del(j.get(), key);
+     engineSettings_ = std::move(j);
 +    enforceBuildFeatures();
    }
    void saveNativeConfig() {
-     const char *configHome = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-@@ -1460,7 +1504,10 @@
-     if (error)
-       return;
-     auto path = directory / "wetypex.json";
+     const auto path = configPath();
 -    std::ifstream oldFile(path);
 +    const auto readPath = preferencesMissing(path)
 +                              ? std::filesystem::path(WETYPE_DEFAULT_SETTINGS)
@@ -429,15 +456,15 @@
      std::string oldBytes((std::istreambuf_iterator<char>(oldFile)), {});
      auto json = wire::parse(oldBytes);
      if (!json || !json_object_is_type(json.get(), json_type_object))
-@@ -1542,6 +1589,7 @@
+@@ -1849,6 +1899,7 @@
      wire::put(json.get(), "device_dictionary_sync",
                bool(*devices.dictionarySync));
      wire::put(json.get(), "device_phrase_sync", bool(*devices.phraseSync));
 +#if WETYPE_ENABLE_VOICE
      const auto &voice = *config_.voice;
-     wire::put(json.get(), "voice_launch_shortcut", bool(*voice.launchShortcut));
-     wire::put(json.get(), "voice_hold_shortcut", bool(*voice.holdShortcut));
-@@ -1562,10 +1610,13 @@
+     wire::put(json.get(), "voice_provider", std::string(*voice.provider == wetype_config::VoiceProviderMode::Local ? "local" : "original"));
+     wire::put(json.get(), "local_voice_model", *voice.localModel);
+@@ -1871,10 +1922,13 @@
              ? "空格替换标点"
              : "智能标点";
      wire::put(json.get(), "voice_punctuation", std::string(punctuation));
@@ -451,7 +478,7 @@
      wire::put(json.get(), "v_mode", bool(*shortcuts.vMode));
      wire::put(json.get(), "half_full_switch", bool(*shortcuts.halfFull));
      wire::put(json.get(), "punctuation_switch",
-@@ -1584,7 +1635,9 @@
+@@ -1893,7 +1947,9 @@
        wire::put(json.get(), name, Key::keyListToString(*option));
      };
      saveKeys("language_switch_keys", shortcuts.languageSwitchKeys);
@@ -461,22 +488,7 @@
      saveKeys("v_mode_keys", shortcuts.vModeKeys);
      saveKeys("half_full_keys", shortcuts.halfFullKeys);
      saveKeys("punctuation_switch_keys", shortcuts.punctuationSwitchKeys);
-@@ -1594,10 +1647,13 @@
-     saveKeys("second_candidate_keys", shortcuts.secondCandidateKeys);
-     saveKeys("third_candidate_keys", shortcuts.thirdCandidateKeys);
-     wire::put(json.get(), "auto_update", bool(*config_.update->autoUpdate));
-+    const auto serialized = wire::dump(json.get()) + '\n';
-+    if (serialized.size() > 16384)
-+      return;
-     auto temporary = path;
-     temporary += ".tmp";
-     std::ofstream output(temporary, std::ios::trunc);
--    output << wire::dump(json.get()) << '\n';
-+    output << serialized;
-     output.close();
-     chmod(temporary.c_str(), 0600);
-     std::filesystem::rename(temporary, path, error);
-@@ -1716,6 +1772,8 @@
+@@ -2020,6 +2076,8 @@
      }
    }
    bool voiceControl(const char *operation, bool traditional = false) {
@@ -485,16 +497,16 @@
      std::ifstream input(stateDirectory() / "voice/control.json");
      std::string bytes(1025, '\0');
      input.read(bytes.data(), bytes.size());
-@@ -1768,6 +1826,8 @@
-     return delivered;
+@@ -2079,6 +2137,8 @@
+     return networkEnabled_ || *config_.voice->provider == wetype_config::VoiceProviderMode::Local;
    }
    void primeVoice() {
 +    if (!WETYPE_ENABLE_VOICE)
 +      return;
      voiceWarmTick_ = now(CLOCK_MONOTONIC);
-     if (networkEnabled_ &&
-         (*config_.voice->launchShortcut || *config_.voice->holdShortcut) &&
-@@ -1795,6 +1855,8 @@
+     if (voiceAvailable() &&
+         ((*config_.voice->launchShortcut && !config_.voice->launchKey->empty()) ||
+@@ -2108,6 +2168,8 @@
      return false;
    }
    void startVoice(InputContext *ic, bool hold) {
@@ -503,7 +515,7 @@
      if (voicePending_ || ic->capabilityFlags().test(CapabilityFlag::Password))
        return;
      auto *s = state(ic);
-@@ -1857,6 +1919,8 @@
+@@ -2179,6 +2241,8 @@
          panel(ic, ic->propertyFor(&factory_));
    }
    void receiveVoice() {
@@ -512,7 +524,7 @@
      if (voicePending_ && voiceDaemonPid_ > 1 &&
          kill(voiceDaemonPid_, 0) < 0 && errno == ESRCH) {
        cancelVoice(false);
-@@ -3048,6 +3112,7 @@
+@@ -3620,6 +3684,7 @@
        : instance_(instance), factory_([this](InputContext &ic) {
            return new State(++nextId_, ic);
          }) {
@@ -520,7 +532,7 @@
      reloadSettings();
      instance_->inputContextManager().registerProperty("wetypexState",
                                                        &factory_);
-@@ -3224,11 +3289,11 @@
+@@ -3776,11 +3841,11 @@
              if (!start())
                scheduleRestart();
            }
@@ -529,20 +541,20 @@
              syncTick_ = time;
              receiveVoice();
            }
--          if (focused && networkEnabled_ && !runtimePending_ && time >= voiceWarmTick_ + 60000000)
-+          if (WETYPE_ENABLE_VOICE && focused && networkEnabled_ && !runtimePending_ && time >= voiceWarmTick_ + 60000000)
+-          if (focused && voiceAvailable() && !runtimePending_ && time >= voiceWarmTick_ + 60000000)
++          if (WETYPE_ENABLE_VOICE && focused && voiceAvailable() && !runtimePending_ && time >= voiceWarmTick_ + 60000000)
              primeVoice();
            pollVModeWindow();
            if (*config_.update->autoUpdate &&
-@@ -3267,6 +3332,7 @@
-   }
-   void setConfig(const RawConfig &raw) override {
+@@ -3823,6 +3888,7 @@
+     const auto oldTheme = *config_.appearance->theme;
+     const auto oldSize = *config_.appearance->candidateSize;
      config_.load(raw, true);
 +    enforceBuildFeatures();
+     const bool themeChanged = *config_.appearance->theme != oldTheme;
+     const bool sizeChanged = *config_.appearance->candidateSize != oldSize;
      saveNativeConfig();
-     applyAppearance();
-     if (runtimePhase_ != RuntimePhase::Idle) {
-@@ -3971,8 +4037,8 @@
+@@ -4643,8 +4709,8 @@
        return;
      if (ic->capabilityFlags().test(CapabilityFlag::Password))
        return;
@@ -553,9 +565,11 @@
          key.checkKeyList(*config_.shortcuts->aiAssistantKeys)) {
        const auto &surrounding = ic->surroundingText();
        if (surrounding.isValid() && surrounding.cursor()) {
+
+diff --git a/src/settings/main.cpp b/src/settings/main.cpp
 --- a/src/settings/main.cpp
 +++ b/src/settings/main.cpp
-@@ -48,7 +48,9 @@
+@@ -54,7 +54,9 @@
  }
  static QJsonObject readSettings() {
    const QString current = configDir() + "/wetypex.json";
@@ -566,9 +580,9 @@
    if (!file.open(QIODevice::ReadOnly))
      return {};
    return QJsonDocument::fromJson(file.readAll()).object();
-@@ -84,9 +86,17 @@
- static bool writeSetting(const QString &key, const QJsonValue &value) {
-   auto settings = readSettings();
+@@ -104,9 +106,17 @@
+       settings.value(key) == value)
+     return true;
    settings[key] = value;
 -  if (!writeFile(configDir() + "/wetypex.json",
 -                 QJsonDocument(settings).toJson()))
@@ -586,7 +600,7 @@
    QDBusInterface controller("org.fcitx.Fcitx5", "/controller",
                              "org.fcitx.Fcitx.Controller1");
    controller.asyncCall("ReloadAddonConfig", "wetypex");
-@@ -668,6 +678,11 @@
+@@ -1013,6 +1023,11 @@
    app.setDesktopFileName("fcitx5-wetypex-settings");
    app.setWindowIcon(appIcon());
    const auto args = app.arguments();
@@ -598,7 +612,7 @@
    const auto settings = readSettings();
    const auto appearance = readAppearance();
    app.setStyleSheet(R"(
-@@ -750,11 +765,15 @@
+@@ -1095,11 +1110,15 @@
      item->setSizeHint({190, 40});
      navigation->addItem(item);
    }
@@ -615,7 +629,7 @@
    deviceNotice->raise();
    root->addWidget(sidebar);
    auto *right = new QWidget;
-@@ -896,7 +915,9 @@
+@@ -1266,7 +1285,9 @@
                    true, "standalone"))}));
    pages->addWidget(input.widget);
  
@@ -625,9 +639,9 @@
    auto *voiceHero = card();
    auto *voiceHeroLayout = new QVBoxLayout(voiceHero);
    voiceHeroLayout->setContentsMargins(16, 18, 16, 18);
-@@ -1033,6 +1054,13 @@
-                            true, "voice_smart_polish"),
-                     52)}));
+@@ -1434,6 +1455,13 @@
+                     polishToggle,
+                     64)}));
    pages->addWidget(voice.widget);
 +#else
 +  // Keep every navigation row mapped to its original page index.
@@ -639,7 +653,7 @@
  
    auto phrases = page("", false);
    phrases.widget->layout()->setContentsMargins(20, 0, 22, 0);
-@@ -1257,18 +1285,23 @@
+@@ -1697,18 +1725,23 @@
    }
    if (vModeTriggers.isEmpty())
      vModeTriggers << QStringLiteral("未绑定");
@@ -672,22 +686,22 @@
 +  shortcuts.body->addWidget(rowsCard(quickShortcutRows));
 +#if WETYPE_ENABLE_VOICE
 +  auto *voiceShortcutCard = rowsCard(
-       {row("语音输入", {}, nullptr, 44),
-        shortcutRow(
-            "启动语音输入",
-@@ -1280,7 +1313,10 @@
-            "按住说话",
-            wetype::settingBool(settings.value("voice_hold_shortcut"), true),
-            {"Ctrl", "Win", "×"}, "按住可语音输入，松手结束", true,
--           "voice_hold_shortcut")}));
-+           "voice_hold_shortcut")});
+       {row("语音输入", "在其他应用的文本框中使用；点击按键可修改", nullptr, 62),
+        voiceShortcutRow("启动语音输入",
+                         "按下启动或结束；\n空格结束，回车上屏，Esc 取消",
+@@ -1716,7 +1749,10 @@
+                         "Control+Super+Shift_L"),
+        voiceShortcutRow("按住说话", "按住可语音输入，松手结束",
+                         "voice_hold_shortcut", "voice_hold_key",
+-                        "Control+Super_L")}));
++                        "Control+Super_L")});
 +  voiceShortcutCard->setObjectName("voiceShortcutCard");
 +  shortcuts.body->addWidget(voiceShortcutCard);
 +#endif
    shortcuts.body->addWidget(rowsCard(
        {row("输入状态切换", {}, nullptr, 44),
         shortcutRow(
-@@ -1629,11 +1665,16 @@
+@@ -2077,11 +2113,16 @@
    pages->addWidget(about.widget);
  
    QObject::connect(navigation, &QListWidget::currentRowChanged, pages,

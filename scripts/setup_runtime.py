@@ -24,6 +24,7 @@ def install_ui_resources(archive, data):
     with zipfile.ZipFile(archive) as z:
         assets={}
         system_theme_root=next((path for path in (
+            pathlib.Path(__file__).resolve().parent.parent/'fcitx5/themes',
             pathlib.Path('/usr/share/fcitx5/themes'),
             pathlib.Path('/usr/local/share/fcitx5/themes'))
             if (path/'wetypex-light/theme.conf').is_file()),None)
@@ -276,7 +277,7 @@ def validate_runtime(target,user_snapshot=None,report=None,converted_snapshot=No
     required=[host,locale,support/'libkqueue.so',support/'wcwss_bridge.so']
     if any(not path.exists() for path in required):
         return False,'WeTypeX engine host is not installed'
-    bwrap=shutil.which('bwrap')
+    bwrap=shutil.which(os.environ.get('WETYPE_SANDBOX') or 'bwrap')
     if not bwrap:
         return False,'bubblewrap is not installed'
     try:
@@ -286,7 +287,7 @@ def validate_runtime(target,user_snapshot=None,report=None,converted_snapshot=No
             return failure('engine host compatibility',network_report)
         capabilities=json.loads(network_report.stdout)
         if not capabilities.get('execution_ready', True):
-            return False,'此 ARM64 CPU 需要兼容执行组件，请通过发行版安装 qemu-user 后重试'
+            return False,'兼容执行组件不可用或不支持所需指令集，请安装或更新 qemu-user；Nix 请启用 enableCompatibilityProvider'
         if not capabilities.get('utf8_json',False):
             return False,'UTF-8 JSON compatibility check failed; upgrade the WeTypeX engine host'
         timeout=90 if capabilities.get('execution_provider')=='qemu' else 25

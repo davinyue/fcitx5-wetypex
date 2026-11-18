@@ -29,6 +29,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/ubuntu-network
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
@@ -66,6 +67,14 @@ jobs:
               "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" transcribe "$XDG_CACHE_HOME/speech.wav" --realtime > "$XDG_CACHE_HOME/voice.json"
               python3 -c '\''import json,os; v=json.load(open(os.environ["XDG_CACHE_HOME"]+"/voice.json")); assert v["ok"] and v["text"].strip()'\''
               "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" shutdown
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" model install --accept-upstream-license
+              mkdir -p "$XDG_CONFIG_HOME/fcitx5"
+              python3 -c '\''import json,os; from pathlib import Path; p=Path(os.environ["XDG_CONFIG_HOME"])/"fcitx5/wetypex.json"; p.write_text(json.dumps({"voice_provider":"local","standalone":True,"voice_smart_polish":True,"voice_copy_to_clipboard":False}))'\''
+              # Reuse the pinned natural-speech fixture from the Flatpak check.
+              python3 -c '\''import hashlib,urllib.request; from pathlib import Path; data=urllib.request.urlopen("https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav",timeout=90).read(); assert hashlib.sha256(data).hexdigest()=="59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e"; Path(__import__("os").environ["XDG_CACHE_HOME"]+"/local-speech.wav").write_bytes(data)'\''
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" transcribe "$XDG_CACHE_HOME/local-speech.wav" --realtime --traditional > "$XDG_CACHE_HOME/local-voice.json"
+              python3 -c '\''import json,os; v=json.load(open(os.environ["XDG_CACHE_HOME"]+"/local-voice.json")); assert v["ok"] and v["text"].strip() and v["provider"]=="local"'\''
+              "$WETYPEX_PREFIX/bin/fcitx5-wetypex-voice" shutdown
             '
       - name: 清理独立运行数据
         if: always()
@@ -84,9 +93,9 @@ jobs:
     steps:
       - name: 安装构建依赖
         run: >-
-          pacman -Syu --noconfirm git cmake clang boost fcitx5 fcitx5-qt libime libc++
+          pacman -Syu --noconfirm git cmake clang rust boost fcitx5 fcitx5-qt libime libc++
           json-c curl openssl bubblewrap util-linux python python-fonttools python-pillow fontconfig qt6-base qt6-svg
-          qt6-webengine layer-shell-qt pipewire ffmpeg wl-clipboard libnotify polkit
+          qt6-webengine layer-shell-qt pipewire ffmpeg opencc wl-clipboard libnotify polkit
       - uses: actions/checkout@v7
       - name: 配置
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
@@ -98,7 +107,7 @@ jobs:
             case "$script" in *-syncd.sh.in|*-update.sh.in|*-sync.sh.in) continue;; esac
             sh -n "$script"
           done
-          python3 -m py_compile scripts/setup_runtime.py scripts/wechat_emoticons.py scripts/voice_stream.py tools/*.py \
+          python3 -m py_compile scripts/setup_runtime.py scripts/wechat_emoticons.py scripts/voice_stream.py scripts/local_voice.py scripts/optional_voice.py scripts/group_sync.py tools/*.py \
             build/fcitx5-wetypex-syncd build/fcitx5-wetypex-update build/fcitx5-wetypex-sync
       - name: 构建 Arch 软件包（启用 LTO）
         run: |
@@ -125,6 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/ubuntu-network
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -134,8 +144,8 @@ jobs:
       - name: 在 Ubuntu 22.04 构建
         run: |
           mkdir -p dist/debian
-          docker build -f packaging/docker/debian.Dockerfile -t wetypex-build-jammy .
-          docker run --rm --user "$(id -u):$(id -g)" \
+          docker build --network host -f packaging/docker/debian.Dockerfile -t wetypex-build-jammy .
+          docker run --rm --network host --user "$(id -u):$(id -g)" \
             -e WETYPEX_BUILD_JOBS=2 \
             -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
             wetypex-build-jammy env WETYPEX_LAYER_SHELL=OFF /src/packaging/container-stage.sh /out/debian-root lib
@@ -156,16 +166,23 @@ jobs:
           sha256sum fcitx5-wetypex_*.deb > SHA256SUMS
       - name: 在旧基线上运行真实原版核心与 TLS 通道
         run: |
-          docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN \
+          docker run --rm --network host --cap-add SYS_ADMIN --cap-add NET_ADMIN \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             -v "$PWD/dist:/out:ro" wetypex-build-jammy bash -euc '
-              apt-get update -qq
-              apt-get install -y --no-install-recommends bubblewrap util-linux python3 python3-fonttools python3-pil fontconfig
+              apt-get -o Acquire::Retries=3 update -qq
+              apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap util-linux python3 python3-fonttools python3-pil fontconfig espeak-ng ffmpeg opencc
               dpkg --unpack /out/debian/*.deb
               fcitx5-wetypex-setup --download --accept-upstream-license
               fcitx5-wetypex-setup --check --transport || {
                 cat /root/.cache/fcitx5-wetypex/last-runtime-check.log; exit 1;
               }
+              fcitx5-wetypex-voice model install --accept-upstream-license
+              mkdir -p /root/.config/fcitx5
+              python3 -c '\''import json; from pathlib import Path; Path("/root/.config/fcitx5/wetypex.json").write_text(json.dumps({"voice_provider":"local","standalone":True,"voice_copy_to_clipboard":False}))'\''
+              python3 -c '\''import hashlib,urllib.request; from pathlib import Path; data=urllib.request.urlopen("https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav",timeout=90).read(); assert hashlib.sha256(data).hexdigest()=="59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e"; Path("/tmp/speech.wav").write_bytes(data)'\''
+              WETYPE_LOCAL_VOICE_CPU=scalar fcitx5-wetypex-voice transcribe /tmp/speech.wav --realtime > /tmp/local-voice.json
+              python3 -c '\''import json; v=json.load(open("/tmp/local-voice.json")); assert v["ok"] and v["text"].strip() and v["provider"]=="local"'\''
+              fcitx5-wetypex-voice shutdown
             '
       - name: 保存兼容旧系统的 deb
         uses: actions/upload-artifact@v7
@@ -184,7 +201,9 @@ jobs:
       fail-fast: false
       matrix:
         image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:bookworm-slim", "debian:trixie-slim"]
-    container: ${{ matrix.image }}
+    container:
+      image: ${{ matrix.image }}
+      options: --dns 1.1.1.1 --dns 8.8.8.8
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -205,6 +224,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/ubuntu-network
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -214,8 +234,8 @@ jobs:
       - name: 在 Ubuntu 20.04 与固定稳定框架 SDK 构建
         run: |
           mkdir -p dist/ubuntu20
-          docker build -f packaging/docker/ubuntu20.Dockerfile -t wetypex-build-focal .
-          docker run --rm --user "$(id -u):$(id -g)" \
+          docker build --network host -f packaging/docker/ubuntu20.Dockerfile -t wetypex-build-focal .
+          docker run --rm --network host --user "$(id -u):$(id -g)" \
             -e WETYPEX_BUILD_JOBS=2 -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
             wetypex-build-focal env WETYPEX_LAYER_SHELL=OFF /src/packaging/container-stage.sh /out/ubuntu20-root lib
           docker run --rm -v "$PWD/dist:/out:ro" wetypex-build-focal \
@@ -241,16 +261,24 @@ jobs:
           sha256sum *.deb > SHA256SUMS
       - name: 在 Focal 与稳定框架 SDK 中运行真实核心
         run: |
-          docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN \
+          # These disposable hosted-runner containers reuse the runner's DNS.
+          docker run --rm --network host --cap-add SYS_ADMIN --cap-add NET_ADMIN \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             -v "$PWD/dist:/out:ro" wetypex-build-focal bash -euc '
-              apt-get update -qq
-              apt-get install -y --no-install-recommends bubblewrap util-linux python3 python3-fonttools python3-pil fontconfig
+              apt-get -o Acquire::Retries=3 update -qq
+              apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap util-linux python3 python3-fonttools python3-pil fontconfig espeak-ng ffmpeg opencc
               dpkg --unpack /out/ubuntu20/*.deb
               fcitx5-wetypex-setup --download --accept-upstream-license
               fcitx5-wetypex-setup --check --transport || {
                 cat /root/.cache/fcitx5-wetypex/last-runtime-check.log; exit 1;
               }
+              fcitx5-wetypex-voice model install --accept-upstream-license
+              mkdir -p /root/.config/fcitx5
+              python3 -c '\''import json; from pathlib import Path; Path("/root/.config/fcitx5/wetypex.json").write_text(json.dumps({"voice_provider":"local","standalone":True,"voice_copy_to_clipboard":False}))'\''
+              python3 -c '\''import hashlib,urllib.request; from pathlib import Path; data=urllib.request.urlopen("https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav",timeout=90).read(); assert hashlib.sha256(data).hexdigest()=="59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e"; Path("/tmp/speech.wav").write_bytes(data)'\''
+              WETYPE_LOCAL_VOICE_CPU=scalar fcitx5-wetypex-voice transcribe /tmp/speech.wav --realtime > /tmp/local-voice.json
+              python3 -c '\''import json; v=json.load(open("/tmp/local-voice.json")); assert v["ok"] and v["text"].strip() and v["provider"]=="local"'\''
+              fcitx5-wetypex-voice shutdown
             '
       - uses: actions/upload-artifact@v7
         with:
